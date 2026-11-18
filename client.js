@@ -442,7 +442,7 @@ function DeleteDialog(props) {
     setPhase({ kind: 'error', code: body?.code, message: body?.message, data: phase.data ?? null })
   }
 
-  const t2 = (key) => props.translate(key)
+  const t2 = (key) => (typeof props.translate === 'function' ? props.translate(key) : key)
 
   const title = request?.displayTitle ?? ''
   const matches = typed.trim() !== '' && typed === title
