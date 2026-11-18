@@ -79,6 +79,11 @@ const DICT = {
     'batch.resultAttachments': '附件：删除 {removed} 个，保留 {kept} 个，释放 {size}',
     'batch.resultFailed': '部分会话未删除',
     'batch.cancel': '取消',
+    'batch.confirmWarning': '确认永久删除所选 {n} 个会话？此操作不可恢复',
+    'batch.confirmDeep': '将同时深度清理无人引用的附件',
+    'batch.confirmNoDeep': '不清理附件',
+    'batch.back': '返回',
+    'batch.confirmDelete': '确认删除',
   },
   en: {
     'menu.deleteSession': 'Delete session',
@@ -128,6 +133,11 @@ const DICT = {
     'batch.resultAttachments': 'Attachments: removed {removed}, kept {kept}, freed {size}',
     'batch.resultFailed': 'Some sessions were not deleted',
     'batch.cancel': 'Cancel',
+    'batch.confirmWarning': 'Permanently delete the {n} selected sessions? This cannot be undone',
+    'batch.confirmDeep': 'Also deep-cleans attachments no remaining session references',
+    'batch.confirmNoDeep': 'Attachments are not cleaned',
+    'batch.back': 'Back',
+    'batch.confirmDelete': 'Confirm delete',
   },
   ja: {
     'menu.deleteSession': 'セッションを削除',
@@ -244,7 +254,8 @@ const SESSION_DELETE_CSS = `
 .sd-link { padding: 0; border: none; background: none; cursor: pointer; font-size: 12px; line-height: 18px; color: var(--dsw-alias-link); }
 .sd-days { width: 56px; height: 26px; padding: 2px 8px; border: 0.5px solid var(--dsw-alias-border-l4); border-radius: var(--dsw-radius-sm); background: transparent; color: var(--dsw-alias-label-primary); font-size: 12px; }
 .sd-list-box { max-height: 300px; overflow: auto; margin: 0 0 12px; border: 0.5px solid var(--dsw-alias-border-l4); border-radius: var(--dsw-radius-sm); }
-.sd-row { display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px; }
+.sd-row { display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px; cursor: pointer; }
+.sd-row:hover { background: var(--dsw-alias-interactive-bg-hover); }
 .sd-row + .sd-row { border-top: 0.5px solid var(--dsw-alias-border-l4); }
 .sd-check { margin-top: 3px; accent-color: var(--dsw-alias-link); }
 .sd-row-main { min-width: 0; flex: 1; }
@@ -558,6 +569,11 @@ function BatchDialog(props) {
     if (phase.kind === 'working') return
     props.dismiss()
   }
+  const requestConfirm = () => {
+    if (selected.size === 0 || phase.kind !== 'ready') return
+    setPhase({ kind: 'confirm', sessions })
+  }
+  const back = () => { setPhase({ kind: 'ready', sessions }) }
   const run = async () => {
     if (selected.size === 0 || phase.kind === 'working') return
     setPhase({ kind: 'working', sessions })
@@ -577,12 +593,18 @@ function BatchDialog(props) {
     if (phase.kind === 'done') {
       return React.createElement(Button, { variant: 'primary', onClick: close }, t2('batch.done'))
     }
+    if (phase.kind === 'confirm') {
+      return [
+        React.createElement(Button, { key: 'back', variant: 'outline', onClick: back }, t2('batch.back')),
+        React.createElement(Button, { key: 'confirm', variant: 'outline', className: 'sd-delete', onClick: () => { void run() } }, t2('batch.confirmDelete')),
+      ]
+    }
     return [
       React.createElement(Button, { key: 'cancel', variant: 'outline', disabled: phase.kind === 'working', onClick: close }, t2('batch.cancel')),
       React.createElement(Button, {
         key: 'delete', variant: 'outline', className: 'sd-delete',
-        disabled: selected.size === 0 || phase.kind === 'working' || phase.kind !== 'ready',
-        onClick: () => { void run() },
+        disabled: selected.size === 0 || phase.kind !== 'ready',
+        onClick: requestConfirm,
       }, phase.kind === 'working' ? t2('batch.deleting') : t2('batch.deleteSelected').replace('{n}', String(selected.size))),
     ]
   })()
@@ -629,6 +651,20 @@ function BatchDialog(props) {
       React.createElement('span', null,
         React.createElement('strong', { style: { fontWeight: 500 } }, t2('batch.deepLabel')),
         ` — ${t2('batch.deepHint')}`),
+    ))
+  }
+  if (phase.kind === 'confirm') {
+    children.push(React.createElement('div', { key: 'confirm-warning', className: 'sd-notice', role: 'alert' },
+      t2('batch.confirmWarning').replace('{n}', String(selected.size))))
+    children.push(React.createElement('div', { key: 'confirm-deep', className: 'sd-meta' },
+      deep ? t2('batch.confirmDeep') : t2('batch.confirmNoDeep')))
+    const chosen = sessions.filter(session => selected.has(session.sessionId))
+    children.push(React.createElement('div', { key: 'confirm-list', className: 'sd-list-box', role: 'group', 'aria-label': t2('batch.confirmDelete') },
+      chosen.map(session => React.createElement('div', { key: session.sessionId, className: 'sd-row' },
+        React.createElement('span', { className: 'sd-row-main' },
+          React.createElement('span', { className: 'sd-row-title' }, titleOf(session.sessionId)),
+          React.createElement('span', { className: 'sd-row-meta' }, formatSize(session.sizeBytes)))),
+      ))
     ))
   }
   if (phase.kind === 'done') {
