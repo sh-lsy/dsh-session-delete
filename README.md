@@ -33,14 +33,21 @@ Deletion is permanent; there is no trash. For the target Session only:
 
 ## Guards
 
-Every guard runs on the Host; the dialog only presents its answer.
+Every guard runs on the Host; the dialog only presents its answer. The dialog
+itself is the confirmation — there is no title to type by default.
 
-- **Live Sessions are refused.** A Session opened during the current run is attached to the in-memory store, and Harness has no public way to evict it; a later append would recreate the directory. Restart Harness and delete it then.
-- **Age threshold.** A Session whose last activity is newer than `minAgeDays` is refused. "Last activity" is the later of the header timestamp and the log's mtime, so a long-session resumed today still counts as recent.
+- **A Session opened this run is deletable.** Its planned work is stopped, it is
+  archived (which blocks any new turn), and an in-flight turn is awaited to
+  finish and flush before the directory is removed, so nothing recreates it.
+  A turn that will not settle within `stopSettleMs` is refused as `still-running`.
+- **Running work asks first.** A turn, subagent, job, or schedule still active is
+  reported as `needs-stop`; confirming "Stop and delete" cancels it, then deletes.
 - **Migration-pending logs are refused.** Open the Session once so it migrates, then delete it.
 - **Only the JSONL backend is supported.** Any other `location.kind` is refused rather than guessed at.
-- **Irreversible confirmation.** The dialog shows a red warning, the complete inventory, and requires typing the Session title before the button enables.
-- **Worktree safety** is the shipped one: `git status` must be clean, the checkout must be unregistered-elsewhere, and `git worktree remove` runs without `--force`. A dirty worktree is retained and reported; the Session log is still deleted.
+- **Worktree safety** is the shipped one: `git status` must be clean, the checkout must be unreferenced elsewhere, and `git worktree remove` runs without `--force`. A dirty worktree is retained and reported; the Session log is still deleted.
+
+There is no age threshold on a manual deletion: naming one Session is an explicit
+choice. An age-based threshold belongs to batch cleanup, which is not implemented yet.
 
 ## Configuration
 
@@ -49,11 +56,11 @@ The bundle patch mounts one row. Override its `config` in your profile's `cordis
 ```yaml
 - id: session-delete
   config:
-    minAgeDays: 1                 # only Sessions inactive for at least N days; 0 disables the guard
-    requireTitleConfirmation: true
+    requireTitleConfirmation: false  # true adds a type-the-title gate on top of the dialog
     deleteSpillArtifacts: true
-    worktreeTimeoutMs: 20000      # how long to wait for the shipped worktree reclamation
-    spillRoots: []                # extra spill roots beside the discovered dsh-spill-* ones
+    worktreeTimeoutMs: 20000         # how long to wait for the shipped worktree reclamation
+    stopSettleMs: 8000               # how long to wait for a stopped turn to finish before deleting
+    spillRoots: []                   # extra spill roots beside the discovered dsh-spill-* ones
 ```
 
 ## Install
@@ -77,10 +84,10 @@ Both require `peer.principal.kind === 'owner'`. The Web half (`client.js`) is a 
 
 ## Known limitations
 
-- Deleting the Session you are currently viewing is refused by design (it is live).
+- A live Session's in-memory object stays attached after deletion (Harness has no public eviction API). It is archived, so it runs no further turn and appends nothing; the sidebar row is removed on refresh. The orphan is released when the process exits.
 - A deleted Session's id stays in the Workspace registry's in-memory header index until the next start; the row is removed immediately and the stale index entry is unreachable from the UI.
 - Lineage: deleting a Session that other Sessions forked from leaves their `parentSession` pointing at nothing. The dialog warns with the child count; only the displayed lineage is affected.
-- Batch cleanup and automatic retention are not implemented. The same guards would apply.
+- Batch cleanup and automatic retention are not implemented. An age threshold would apply there, not to a manual deletion.
 
 ## Development
 

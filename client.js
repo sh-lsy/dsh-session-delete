@@ -100,10 +100,12 @@ const DICT = {
     'dialog.success': '会话已永久删除。',
     'dialog.successSize': '已释放 {size}。',
     'dialog.successWorktree': '工作树：{status}',
-    'dialog.mismatch': '输入的标题与会话标题不一致。',
+    'dialog.mismatch': '输入的标题与会话标题不一致',
     'dialog.loading': '正在检查…',
+    'dialog.liveHint': '该会话本次运行中打开过，删除时会先停止其工作并从列表移除',
     'failure.deleteSession': '删除会话失败',
-    'reason.session-live': '该会话在本次运行中打开过。请重启 DeepSeek Harness 后再删除。',
+    'reason.session-live': '该会话在本次运行中打开过，请重启 DeepSeek Harness 后再删除',
+    'reason.still-running': '该会话仍在运行轮次，请先停止再删除',
     'reason.migration-required': '该会话的日志是旧格式，请先打开一次完成迁移，然后再删除。',
     'reason.unsupported-backend': '仅支持官方默认的 JSONL 持久化后端。',
     'reason.too-recent': '该会话距最后活动不足阈值天数。',
@@ -145,10 +147,12 @@ const DICT = {
     'dialog.success': 'Session permanently deleted.',
     'dialog.successSize': 'Freed {size}.',
     'dialog.successWorktree': 'Worktree: {status}',
-    'dialog.mismatch': 'The typed title does not match the session title.',
+    'dialog.mismatch': 'The typed title does not match the session title',
     'dialog.loading': 'Checking…',
+    'dialog.liveHint': 'This session was opened during this run; its work is stopped and it is removed from the list when deleted',
     'failure.deleteSession': 'Session deletion failed',
     'reason.session-live': 'This session was opened during this run. Restart DeepSeek Harness, then delete it.',
+    'reason.still-running': 'This session is still running a turn; stop it and try again',
     'reason.migration-required': 'This session log uses an older format. Open it once to migrate, then delete it.',
     'reason.unsupported-backend': 'Only the shipped JSONL persistence backend is supported.',
     'reason.too-recent': 'This session is newer than the configured threshold.',
@@ -513,9 +517,10 @@ function DeleteDialog(props) {
         React.createElement('span', { className: 'sd-meta-val' }, formatTime(data.lastActivity)),
         React.createElement('span', { className: 'sd-meta-key' }, t2('dialog.size')),
         React.createElement('span', { className: 'sd-meta-val' }, formatSize(data.sizeBytes)),
-        React.createElement('span', { className: 'sd-meta-key' }, t2('dialog.threshold')),
-        React.createElement('span', { className: 'sd-meta-val' }, `${String(data.minAgeDays)} day(s)`),
       ))
+      if (data.live === true) {
+        children.push(React.createElement('div', { key: 'live', className: 'sd-hint' }, t2('dialog.liveHint')))
+      }
       children.push(React.createElement('div', { key: 'delete-head', className: 'sd-section' }, t2('dialog.willDelete')))
       children.push(React.createElement('ul', { key: 'delete-list', className: 'sd-list' },
         ['dialog.item.log', 'dialog.item.cache', 'dialog.item.spill', 'dialog.item.worktree', 'dialog.item.account', 'dialog.item.plan']

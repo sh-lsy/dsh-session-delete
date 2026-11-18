@@ -8,13 +8,16 @@
  *
  * Removal order is chosen so every irreversible step happens once and every
  * later step is idempotent:
- *   1. guards (live, format, backend, age),
+ *   1. guards (format, backend) — a Session opened this run is deletable too,
  *   2. stop planned work, then archive — the archive set is what the worktree
- *      reclamation reads to stop counting this Session as a referrer,
- *   3. wait for the worktree reclamation to settle,
- *   4. delete the Session directory (all generations),
- *   5. delete spill output and the projection-cache document,
- *   6. drop Workspace accounting, the pin, and the archive entry.
+ *      reclamation reads to stop counting this Session as a referrer, and the
+ *      archive gate blocks any new turn,
+ *   3. for a live Session, wait for its in-flight turn to finish and flush so
+ *      nothing recreates the directory after it is removed,
+ *   4. wait for the worktree reclamation to settle,
+ *   5. delete the Session directory (all generations),
+ *   6. delete spill output and the projection-cache document,
+ *   7. drop Workspace accounting, the pin, and the archive entry.
  *
  * @module @sh-lsy/dsh-session-delete
  */
@@ -29,7 +32,6 @@ export const name = 'session-delete'
 /** Required services; optional ones are read with `ctx.get()`. */
 export const inject = ['webServer', 'sessionPersistence', 'workspaceRegistry']
 
-const DAY_MS = 86_400_000
 const INSPECT_PATH = '/session-delete/inspect'
 const DELETE_PATH = '/session-delete/delete'
 const MAX_BODY_BYTES = 64 * 1024
@@ -41,10 +43,10 @@ const PROJECTION_CACHE_TABLE = 'sessions'
 /** Defaults for the row's `config`; every field is overridable from `cordis.patch.yml`. */
 export function defaultConfig() {
   return {
-    minAgeDays: 1,
-    requireTitleConfirmation: true,
+    requireTitleConfirmation: false,
     deleteSpillArtifacts: true,
     worktreeTimeoutMs: 20_000,
+    stopSettleMs: 8_000,
     spillRoots: [],
   }
 }
@@ -58,13 +60,12 @@ export function resolveConfig(raw) {
   const base = defaultConfig()
   if (raw === undefined || raw === null) return base
   if (typeof raw !== 'object') throw new TypeError('session-delete: config must be an object')
-  const minAgeDays = raw.minAgeDays ?? base.minAgeDays
-  if (typeof minAgeDays !== 'number' || !Number.isFinite(minAgeDays) || minAgeDays < 0) {
-    throw new TypeError('session-delete: config.minAgeDays must be a non-negative number')
-  }
-  const worktreeTimeoutMs = raw.worktreeTimeoutMs ?? base.worktreeTimeoutMs
-  if (typeof worktreeTimeoutMs !== 'number' || !Number.isFinite(worktreeTimeoutMs) || worktreeTimeoutMs < 0) {
-    throw new TypeError('session-delete: config.worktreeTimeoutMs must be a non-negative number')
+  const duration = (key) => {
+    const value = raw[key] ?? base[key]
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      throw new TypeError(`session-delete: config.${key} must be a non-negative number`)
+    }
+    return value
   }
   const spillRoots = raw.spillRoots ?? base.spillRoots
   if (!Array.isArray(spillRoots) || spillRoots.some(root => typeof root !== 'string' || root === '')) {
@@ -76,10 +77,10 @@ export function resolveConfig(raw) {
     return value
   }
   return {
-    minAgeDays,
     requireTitleConfirmation: flag('requireTitleConfirmation'),
     deleteSpillArtifacts: flag('deleteSpillArtifacts'),
-    worktreeTimeoutMs,
+    worktreeTimeoutMs: duration('worktreeTimeoutMs'),
+    stopSettleMs: duration('stopSettleMs'),
     spillRoots: [...spillRoots],
   }
 }
@@ -155,14 +156,8 @@ export async function inspectSession(ctx, config, sessionId) {
   }
   const header = snapshot.header
   const lastActivity = await lastActivityOf(snapshot)
-  const ageDays = Math.max(0, (Date.now() - lastActivity) / DAY_MS)
+  const live = isLive(ctx, sessionId)
   const reasons = []
-  if (isLive(ctx, sessionId)) {
-    reasons.push({
-      code: 'session-live',
-      message: 'the Session was opened during this run; restart DeepSeek Harness and delete it then',
-    })
-  }
   if (snapshot.formatStatus === 'migration-required') {
     reasons.push({
       code: 'migration-required',
@@ -175,12 +170,6 @@ export async function inspectSession(ctx, config, sessionId) {
       message: 'only the shipped JSONL persistence backend is supported',
     })
   }
-  if (ageDays < config.minAgeDays) {
-    reasons.push({
-      code: 'too-recent',
-      message: `the Session was active ${formatDays(ageDays)} ago; the current threshold is ${config.minAgeDays} day(s)`,
-    })
-  }
   const worktrees = ownedWorktrees(ctx, header)
   return {
     ok: true,
@@ -188,12 +177,14 @@ export async function inspectSession(ctx, config, sessionId) {
       sessionId,
       createdAt: header.createdAt,
       lastActivity,
-      ageDays,
-      minAgeDays: config.minAgeDays,
       sizeBytes: snapshot.sizeBytes ?? null,
       directory: snapshot.location?.path === undefined ? null : dirname(snapshot.location.path),
       eligible: reasons.length === 0,
       reasons,
+      // A Session opened this run is deletable too: its work is stopped and its
+      // turn awaited before the directory is removed, so nothing recreates it.
+      live,
+      runningTurn: live && ctx.get('agents')?.get(sessionId)?.status === 'running',
       childSessions: await countChildren(ctx, sessionId),
       worktree: worktrees[0]?.worktree ?? null,
       archived: ctx.workspaceRegistry.archivedSessionIds.includes(sessionId),
@@ -247,6 +238,19 @@ export async function deleteSession(ctx, config, request) {
     warnings.push(`archive: ${messageOf(error)}`)
   }
 
+  // A live Agent holds an open write handle. Archiving blocks new turns, but a
+  // turn already in flight must finish and flush before the directory goes, or
+  // its closing append would recreate the deleted Session. An idle live Session
+  // passes immediately; a stopped one settles within the bounded wait.
+  if (data.live && !(await waitForIdle(ctx, sessionId, config.stopSettleMs))) {
+    return {
+      ok: false,
+      code: 'still-running',
+      message: 'the Session is still running a turn; stop it and try again',
+      details: { worktree: null, warnings },
+    }
+  }
+
   const worktree = await reclaimWorktree(ctx, config, sessionId, data.worktree)
 
   try {
@@ -285,6 +289,26 @@ export async function deleteSession(ctx, config, request) {
 function isLive(ctx, sessionId) {
   return ctx.get('sessions')?.get(sessionId) !== undefined
     || ctx.get('agents')?.get(sessionId) !== undefined
+}
+
+/**
+ * Wait until the Session's Agent is no longer running a turn.
+ *
+ * The archive admission reports a running turn as activity and the stop path
+ * cancels it without awaiting settlement, so the caller polls here before
+ * removing the directory. An idle or absent Agent resolves at once.
+ * @param ctx - Host context.
+ * @param sessionId - the Session whose Agent is watched.
+ * @param timeoutMs - bounded wait before reporting the turn still running.
+ * @returns true once no turn is running, false when the wait expired.
+ */
+async function waitForIdle(ctx, sessionId, timeoutMs) {
+  const running = () => ctx.get('agents')?.get(sessionId)?.status === 'running'
+  const deadline = Date.now() + timeoutMs
+  while (running() && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  return !running()
 }
 
 /** The Session's own recorded checkouts, newest first, when the projection cache holds them. */
@@ -454,12 +478,6 @@ function sendJson(res, status, body) {
   res.setHeader('content-type', 'application/json; charset=utf-8')
   res.setHeader('cache-control', 'no-store')
   res.end(JSON.stringify(body))
-}
-
-/** Render a human-readable day count for refusal messages. */
-function formatDays(days) {
-  if (days < 1) return `${Math.max(0, Math.round(days * 24))} hour(s)`
-  return `${days.toFixed(1)} day(s)`
 }
 
 /** Read a message off an arbitrary thrown value. */

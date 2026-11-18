@@ -1,7 +1,7 @@
 /**
  * Host-half behaviour: config validation, the read-only inventory, every
- * refusal branch, and the ordering of an accepted deletion against a real
- * temporary Session directory.
+ * refusal branch, live-Session handling, and the ordering of an accepted
+ * deletion against a real temporary Session directory.
  */
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, rm, stat, utimes, writeFile } from 'node:fs/promises'
@@ -20,8 +20,6 @@ async function sessionDir(root, id = SESSION, ageDays = 3) {
   await mkdir(directory, { recursive: true })
   const log = join(directory, 'session.v1.jsonl')
   await writeFile(log, '{"seq":0}\n')
-  // The age guard reads the later of the header timestamp and the log's own
-  // mtime, so a fixture that should look old must back-date the file too.
   const stamp = new Date(Date.now() - ageDays * DAY)
   await utimes(log, stamp, stamp)
   return { directory, log }
@@ -29,24 +27,22 @@ async function sessionDir(root, id = SESSION, ageDays = 3) {
 
 /** Minimal Host context double covering exactly the members the plugin reads. */
 function makeContext(options = {}) {
-  const removed = []
   const archived = new Set(options.archived ?? [])
   const pinned = new Set(options.pinned ?? [])
   const workspaces = options.workspaces ?? []
   const routes = new Map()
-  const events = new Map()
+  const agentState = { status: options.agentStatus ?? 'idle' }
   return {
-    removed,
     routes,
     archived,
     pinned,
+    agentState,
     logger: { info() {}, warn() {} },
     webServer: { register: (route) => { routes.set(route.path, route); return () => routes.delete(route.path) } },
     sessionPersistence: {
       stat: options.stat ?? (async () => undefined),
       list: options.list ?? (async () => []),
     },
-    sessionQuery: undefined,
     workspaceRegistry: {
       list: () => workspaces,
       get archivedSessionIds() { return [...archived] },
@@ -58,11 +54,12 @@ function makeContext(options = {}) {
     waterfall: async (_name, _payload, next) => next(),
     parallel: async () => undefined,
     effect: (fn) => fn(),
-    on: (name, listener) => {
-      events.set(name, listener)
-      return () => events.delete(name)
+    on: () => () => {},
+    get: (name) => {
+      if (name === 'agents' && options.live === true) return { get: () => agentState }
+      if (name === 'sessions' && options.live === true) return { get: () => ({ header: {} }) }
+      return options.services?.[name]
     },
-    get: (name) => options.services?.[name],
   }
 }
 
@@ -79,19 +76,18 @@ function snapshot(log, overrides = {}) {
 
 test('resolveConfig validates every field and keeps the documented defaults', () => {
   assert.deepEqual(resolveConfig(undefined), {
-    minAgeDays: 1,
-    requireTitleConfirmation: true,
+    requireTitleConfirmation: false,
     deleteSpillArtifacts: true,
     worktreeTimeoutMs: 20000,
+    stopSettleMs: 8000,
     spillRoots: [],
   })
-  assert.equal(resolveConfig({ minAgeDays: 3 }).minAgeDays, 3)
-  assert.equal(resolveConfig({ minAgeDays: 0 }).minAgeDays, 0)
-  assert.throws(() => resolveConfig({ minAgeDays: -1 }), /non-negative/u)
-  assert.throws(() => resolveConfig({ minAgeDays: '1' }), /non-negative/u)
+  assert.equal(resolveConfig({ requireTitleConfirmation: true }).requireTitleConfirmation, true)
+  assert.equal(resolveConfig({ stopSettleMs: 0 }).stopSettleMs, 0)
+  assert.throws(() => resolveConfig({ stopSettleMs: -1 }), /non-negative/u)
+  assert.throws(() => resolveConfig({ worktreeTimeoutMs: '1' }), /non-negative/u)
   assert.throws(() => resolveConfig({ requireTitleConfirmation: 'yes' }), /boolean/u)
   assert.throws(() => resolveConfig({ spillRoots: [''] }), /non-empty strings/u)
-  assert.throws(() => resolveConfig({ worktreeTimeoutMs: -5 }), /non-negative/u)
 })
 
 test('apply registers two owner-only POST routes', () => {
@@ -117,50 +113,43 @@ test('inspect reports the inventory and blocks a missing session', async () => {
     const inspected = await inspectSession(ctx, config, SESSION)
     assert.equal(inspected.ok, true)
     assert.equal(inspected.data.eligible, true)
+    assert.equal(inspected.data.live, false)
     assert.equal(inspected.data.sizeBytes, 2048)
     assert.deepEqual(inspected.data.reasons, [])
-    assert.equal(inspected.data.directory !== null, true)
   } finally {
     await rm(root, { recursive: true, force: true })
   }
 })
 
-test('inspect blocks a live session, an unsupported backend, a migration, and a too-recent session', async () => {
+test('inspect blocks an unsupported backend and a migration, but not a live or recent session', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-sd-'))
   try {
     const { log } = await sessionDir(root)
-    const config = resolveConfig({ minAgeDays: 1 })
+    const config = resolveConfig(undefined)
 
-    const live = makeContext({
-      stat: async () => snapshot(log),
-      services: { sessions: { get: () => ({ header: {} }) } },
-    })
-    assert.equal((await inspectSession(live, config, SESSION)).data.reasons[0].code, 'session-live')
-
-    const backend = makeContext({
-      stat: async () => snapshot(log, { location: { kind: 'sqlite', path: log } }),
-    })
+    const backend = makeContext({ stat: async () => snapshot(log, { location: { kind: 'sqlite', path: log } }) })
     assert.equal((await inspectSession(backend, config, SESSION)).data.reasons[0].code, 'unsupported-backend')
 
-    const migration = makeContext({
-      stat: async () => snapshot(log, { formatStatus: 'migration-required' }),
-    })
+    const migration = makeContext({ stat: async () => snapshot(log, { formatStatus: 'migration-required' }) })
     assert.equal((await inspectSession(migration, config, SESSION)).data.reasons[0].code, 'migration-required')
 
-    const recent = makeContext({
-      stat: async () => snapshot(log, {
-        header: { id: SESSION, version: 1, createdAt: Date.now(), isSeeded: false, cwd: '/tmp/demo' },
-      }),
-    })
-    const inspected = await inspectSession(recent, config, SESSION)
-    assert.equal(inspected.data.eligible, false)
-    assert.ok(inspected.data.reasons.some(reason => reason.code === 'too-recent'))
+    // A Session opened this run, even one active today, is deletable.
+    const live = makeContext({ stat: async () => snapshot(log), live: true, agentStatus: 'idle' })
+    const inspected = await inspectSession(live, config, SESSION)
+    assert.equal(inspected.data.eligible, true)
+    assert.equal(inspected.data.live, true)
+    assert.equal(inspected.data.runningTurn, false)
+
+    const running = makeContext({ stat: async () => snapshot(log), live: true, agentStatus: 'running' })
+    const runningInspected = await inspectSession(running, config, SESSION)
+    assert.equal(runningInspected.data.eligible, true)
+    assert.equal(runningInspected.data.runningTurn, true)
   } finally {
     await rm(root, { recursive: true, force: true })
   }
 })
 
-test('delete refuses without acknowledgement, then needs a stop, then removes everything', async () => {
+test('delete needs no title by default, then needs a stop, then removes everything', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-sd-'))
   try {
     const { directory, log } = await sessionDir(root)
@@ -169,30 +158,65 @@ test('delete refuses without acknowledgement, then needs a stop, then removes ev
       detached: [],
       async detachSession(id) { this.detached.push(id); this.sessionIds = this.sessionIds.filter(entry => entry !== id) },
     }
-    const ctx = makeContext({
-      stat: async () => snapshot(log),
-      workspaces: [workspace],
-      archived: [SESSION],
-      pinned: [SESSION],
-    })
+    const ctx = makeContext({ stat: async () => snapshot(log), workspaces: [workspace], archived: [SESSION], pinned: [SESSION] })
     const config = resolveConfig(undefined)
 
-    const unacknowledged = await deleteSession(ctx, config, { sessionId: SESSION })
-    assert.equal(unacknowledged.code, 'title-required')
-
     ctx.waterfall = async () => [{ kind: 'schedule', id: 'task-1' }]
-    const needsStop = await deleteSession(ctx, config, { sessionId: SESSION, confirmTitle: 'x', acknowledged: true })
+    const needsStop = await deleteSession(ctx, config, { sessionId: SESSION })
     assert.equal(needsStop.code, 'needs-stop')
     assert.equal(needsStop.activity.length, 1)
 
     ctx.waterfall = async (_name, _payload, next) => next()
-    const deleted = await deleteSession(ctx, config, { sessionId: SESSION, confirmTitle: 'x', acknowledged: true })
+    const deleted = await deleteSession(ctx, config, { sessionId: SESSION })
     assert.equal(deleted.ok, true)
     assert.equal(deleted.data.status, 'deleted')
     await assert.rejects(stat(directory), /ENOENT/u)
     assert.deepEqual(workspace.detached, [SESSION])
     assert.equal(ctx.archived.has(SESSION), false)
     assert.equal(ctx.pinned.has(SESSION), false)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('delete still honours an opt-in title confirmation', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-sd-'))
+  try {
+    const { log } = await sessionDir(root)
+    const ctx = makeContext({ stat: async () => snapshot(log) })
+    const config = resolveConfig({ requireTitleConfirmation: true })
+    const refused = await deleteSession(ctx, config, { sessionId: SESSION })
+    assert.equal(refused.code, 'title-required')
+    const deleted = await deleteSession(ctx, config, { sessionId: SESSION, confirmTitle: 'x', acknowledged: true })
+    assert.equal(deleted.ok, true)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('delete removes a live idle session after its turn is confirmed closed', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-sd-'))
+  try {
+    const { directory, log } = await sessionDir(root)
+    const ctx = makeContext({ stat: async () => snapshot(log), live: true, agentStatus: 'idle' })
+    const deleted = await deleteSession(ctx, resolveConfig(undefined), { sessionId: SESSION })
+    assert.equal(deleted.ok, true)
+    await assert.rejects(stat(directory), /ENOENT/u)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('delete refuses a live session whose turn never settles within the wait', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-sd-'))
+  try {
+    const { directory, log } = await sessionDir(root)
+    const ctx = makeContext({ stat: async () => snapshot(log), live: true, agentStatus: 'running' })
+    const deleted = await deleteSession(ctx, resolveConfig({ stopSettleMs: 50 }), { sessionId: SESSION, stopActivity: true })
+    assert.equal(deleted.ok, false)
+    assert.equal(deleted.code, 'still-running')
+    // Nothing was removed: the directory is intact.
+    assert.equal((await stat(directory)).isDirectory(), true)
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -206,9 +230,7 @@ test('delete stops planned work first when the caller asks for it', async () => 
     const ctx = makeContext({ stat: async () => snapshot(log) })
     ctx.waterfall = async () => [{ kind: 'job', id: 'job-1' }]
     ctx.parallel = async (name) => { calls.push(name) }
-    const deleted = await deleteSession(ctx, resolveConfig(undefined), {
-      sessionId: SESSION, confirmTitle: 'x', acknowledged: true, stopActivity: true,
-    })
+    const deleted = await deleteSession(ctx, resolveConfig(undefined), { sessionId: SESSION, stopActivity: true })
     assert.equal(deleted.ok, true)
     assert.deepEqual(calls, ['workspace/session-stop'])
   } finally {
@@ -216,17 +238,13 @@ test('delete stops planned work first when the caller asks for it', async () => 
   }
 })
 
-test('a missing directory reports the failure and keeps the accounting', async () => {
+test('a vanished directory is an idempotent success', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-sd-'))
   try {
     const { directory, log } = await sessionDir(root)
-    const workspace = { sessionIds: [SESSION], detached: [], async detachSession() { this.detached.push('x') } }
-    const ctx = makeContext({ stat: async () => snapshot(log), workspaces: [workspace] })
+    const ctx = makeContext({ stat: async () => snapshot(log) })
     await rm(directory, { recursive: true, force: true })
-    // A vanished directory is an idempotent success: removing it again changes nothing.
-    const deleted = await deleteSession(ctx, resolveConfig(undefined), {
-      sessionId: SESSION, confirmTitle: 'x', acknowledged: true,
-    })
+    const deleted = await deleteSession(ctx, resolveConfig(undefined), { sessionId: SESSION })
     assert.equal(deleted.ok, true)
   } finally {
     await rm(root, { recursive: true, force: true })

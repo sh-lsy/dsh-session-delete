@@ -7,13 +7,13 @@
 #
 # Patch a row by id with a complete `config` object to change the defaults:
 #   - id: session-delete
-#     config: { minAgeDays: 3 }
+#     config: { requireTitleConfirmation: true }
 - insert:
     - id: session-delete
       name: '@sh-lsy/dsh-session-delete'
       config:
-        minAgeDays: 1
-        requireTitleConfirmation: true
+        requireTitleConfirmation: false
         deleteSpillArtifacts: true
         worktreeTimeoutMs: 20000
+        stopSettleMs: 8000
         spillRoots: []
