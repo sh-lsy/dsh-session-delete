@@ -230,10 +230,10 @@ const DICT = {
 // the product's 13px detail scale; the dialog stays as minimal as the built-in
 // stop-and-archive confirmation.
 const SESSION_DELETE_CSS = `
-.sd-dialog { width: min(440px, 100%); max-height: 100%; overflow: hidden; }
-.sd-batch-dialog { width: min(560px, 100%); max-height: 100%; overflow: hidden; }
+.sd-dialog.sd-dialog { width: min(440px, 100%); max-height: 100%; overflow: hidden; }
+.sd-batch-dialog.sd-batch-dialog { width: min(560px, 100%); max-height: 100%; overflow: hidden; }
 @supports (height: 100dvh) {
-  .sd-dialog, .sd-batch-dialog { max-height: calc(100dvh - 48px); }
+  .sd-dialog.sd-dialog, .sd-batch-dialog.sd-batch-dialog { max-height: calc(100dvh - 48px); }
 }
 .sd-content { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
 .sd-notice {
