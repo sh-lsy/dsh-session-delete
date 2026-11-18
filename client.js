@@ -25,6 +25,8 @@ try {
 const NS = 'sessionDelete'
 const INSPECT_PATH = '/session-delete/inspect'
 const DELETE_PATH = '/session-delete/delete'
+const BATCH_INSPECT_PATH = '/session-delete/batch-inspect'
+const BATCH_DELETE_PATH = '/session-delete/batch-delete'
 const MENU_ORDER = 700 // the built-in archive contribution sits at 600
 const STYLE_ID = 'session-delete-styles'
 
@@ -56,6 +58,27 @@ const DICT = {
     'reason.not-found': '该会话不存在，可能已被删除',
     'reason.delete-failed': '删除失败：',
     'reason.network': '与后台的通信失败',
+    'menu.batchCleanup': '批量清理会话',
+    'batch.title': '批量清理会话',
+    'batch.warning': '将永久删除所选会话，运行中的工作会先停止；此操作不可恢复',
+    'batch.deepLabel': '深度清理附件',
+    'batch.deepHint': '仅删除所选会话产生、且其他会话不再引用的附件；工作区仍在用的保留',
+    'batch.selectAll': '全选',
+    'batch.selectNone': '清空',
+    'batch.olderThan': '选择天以上',
+    'batch.apply': '应用',
+    'batch.empty': '该工作区没有会话',
+    'batch.loading': '正在加载会话…',
+    'batch.live': '运行中',
+    'batch.meta': '{size} · {time}',
+    'batch.deleteSelected': '删除所选（{n}）',
+    'batch.deleting': '正在删除…',
+    'batch.done': '完成',
+    'batch.resultTitle': '清理完成',
+    'batch.resultSessions': '删除 {ok}/{total} 个会话，释放 {size}',
+    'batch.resultAttachments': '附件：删除 {removed} 个，保留 {kept} 个，释放 {size}',
+    'batch.resultFailed': '部分会话未删除',
+    'batch.cancel': '取消',
   },
   en: {
     'menu.deleteSession': 'Delete session',
@@ -84,6 +107,27 @@ const DICT = {
     'reason.not-found': 'This session does not exist; it may already be deleted',
     'reason.delete-failed': 'Deletion failed: ',
     'reason.network': 'Communication with the Host failed',
+    'menu.batchCleanup': 'Clean up sessions',
+    'batch.title': 'Clean up sessions',
+    'batch.warning': 'Permanently deletes the selected sessions; running work is stopped first. This cannot be undone',
+    'batch.deepLabel': 'Deep attachment cleanup',
+    'batch.deepHint': 'Only removes attachments the selected sessions produced and no remaining session references; workspace-level ones are kept',
+    'batch.selectAll': 'Select all',
+    'batch.selectNone': 'Clear',
+    'batch.olderThan': 'Select older than (days)',
+    'batch.apply': 'Apply',
+    'batch.empty': 'This workspace has no sessions',
+    'batch.loading': 'Loading sessions…',
+    'batch.live': 'running',
+    'batch.meta': '{size} · {time}',
+    'batch.deleteSelected': 'Delete selected ({n})',
+    'batch.deleting': 'Deleting…',
+    'batch.done': 'Done',
+    'batch.resultTitle': 'Cleanup complete',
+    'batch.resultSessions': 'Deleted {ok}/{total} sessions, freed {size}',
+    'batch.resultAttachments': 'Attachments: removed {removed}, kept {kept}, freed {size}',
+    'batch.resultFailed': 'Some sessions were not deleted',
+    'batch.cancel': 'Cancel',
   },
   ja: {
     'menu.deleteSession': 'セッションを削除',
@@ -195,6 +239,19 @@ const SESSION_DELETE_CSS = `
 .sd-list li { overflow-wrap: anywhere; }
 .sd-status { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }
 .sd-delete:not(:disabled) { color: var(--dsw-alias-state-error-primary); }
+.sd-batch-dialog { width: min(520px, 100%); }
+.sd-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0 0 10px; }
+.sd-link { padding: 0; border: none; background: none; cursor: pointer; font-size: 12px; line-height: 18px; color: var(--dsw-alias-link); }
+.sd-days { width: 56px; height: 26px; padding: 2px 8px; border: 0.5px solid var(--dsw-alias-border-l4); border-radius: var(--dsw-radius-sm); background: transparent; color: var(--dsw-alias-label-primary); font-size: 12px; }
+.sd-list-box { max-height: 300px; overflow: auto; margin: 0 0 12px; border: 0.5px solid var(--dsw-alias-border-l4); border-radius: var(--dsw-radius-sm); }
+.sd-row { display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px; }
+.sd-row + .sd-row { border-top: 0.5px solid var(--dsw-alias-border-l4); }
+.sd-check { margin-top: 3px; accent-color: var(--dsw-alias-link); }
+.sd-row-main { min-width: 0; flex: 1; }
+.sd-row-title { font-size: 13px; line-height: 20px; color: var(--dsw-alias-label-primary); overflow-wrap: anywhere; }
+.sd-row-meta { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-caption); }
+.sd-badge { font-size: 11px; line-height: 16px; color: var(--dsw-alias-state-warn-primary); }
+.sd-deep { display: flex; align-items: flex-start; gap: 8px; margin: 0 0 4px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }
 `
 
 /** Install the stylesheet once, directly into the document head. */
@@ -450,6 +507,165 @@ function DeleteDialog(props) {
   }, ...children)
 }
 
+/** The batch-cleanup dialog: multi-select a workspace's sessions, optional attachment GC. */
+function BatchDialog(props) {
+  const request = typeof props.useBatchRequest === 'function' ? props.useBatchRequest(state => state) : null
+  const [phase, setPhase] = React.useState({ kind: 'idle' })
+  const [selected, setSelected] = React.useState(() => new Set())
+  const [deep, setDeep] = React.useState(false)
+  const [ageInput, setAgeInput] = React.useState('1')
+
+  React.useEffect(() => {
+    if (request === null) {
+      setPhase({ kind: 'idle' })
+      setSelected(new Set())
+      setDeep(false)
+      return undefined
+    }
+    let cancelled = false
+    setPhase({ kind: 'loading' })
+    setSelected(new Set())
+    setDeep(false)
+    post(BATCH_INSPECT_PATH, { workspaceId: request.workspaceId })
+      .then((body) => {
+        if (cancelled) return
+        setPhase(body?.ok === true
+          ? { kind: 'ready', sessions: body.data.sessions ?? [] }
+          : { kind: 'error', message: body?.message })
+      })
+      .catch((error) => {
+        if (!cancelled) setPhase({ kind: 'error', message: String(error) })
+      })
+    return () => { cancelled = true }
+  }, [request])
+
+  const t2 = (key) => (typeof props.translate === 'function' ? props.translate(key) : key)
+  const titleOf = (id) => (typeof props.titleOf === 'function' ? props.titleOf(id) : id)
+  const sessions = phase.sessions ?? []
+  const toggle = (id) => setSelected((prev) => {
+    const next = new Set(prev)
+    if (next.has(id)) next.delete(id)
+    else next.add(id)
+    return next
+  })
+  const selectOlder = () => {
+    const days = Number(ageInput)
+    if (!Number.isFinite(days) || days < 0) return
+    const cutoff = Date.now() - days * 86_400_000
+    setSelected(new Set(sessions.filter(s => (s.lastActivity ?? 0) <= cutoff).map(s => s.sessionId)))
+  }
+  const close = () => {
+    if (phase.kind === 'working') return
+    props.dismiss()
+  }
+  const run = async () => {
+    if (selected.size === 0 || phase.kind === 'working') return
+    setPhase({ kind: 'working', sessions })
+    const body = await post(BATCH_DELETE_PATH, { sessionIds: [...selected], deepAttachments: deep })
+      .catch(error => ({ ok: false, message: String(error) }))
+    if (body?.ok === true) {
+      setPhase({ kind: 'done', data: body.data })
+      try {
+        props.refreshSessions()
+      } catch { /* best-effort; the Host already deleted the sessions */ }
+      return
+    }
+    setPhase({ kind: 'error', message: body?.message, sessions })
+  }
+
+  const footer = (() => {
+    if (phase.kind === 'done') {
+      return React.createElement(Button, { variant: 'primary', onClick: close }, t2('batch.done'))
+    }
+    return [
+      React.createElement(Button, { key: 'cancel', variant: 'outline', disabled: phase.kind === 'working', onClick: close }, t2('batch.cancel')),
+      React.createElement(Button, {
+        key: 'delete', variant: 'outline', className: 'sd-delete',
+        disabled: selected.size === 0 || phase.kind === 'working' || phase.kind !== 'ready',
+        onClick: () => { void run() },
+      }, phase.kind === 'working' ? t2('batch.deleting') : t2('batch.deleteSelected').replace('{n}', String(selected.size))),
+    ]
+  })()
+
+  const children = []
+  if (phase.kind === 'loading') {
+    children.push(React.createElement('div', { key: 'loading', className: 'sd-status', role: 'status' }, t2('batch.loading')))
+  }
+  if (phase.kind === 'ready' || phase.kind === 'working') {
+    children.push(React.createElement('div', { key: 'warning', className: 'sd-notice' }, t2('batch.warning')))
+    children.push(React.createElement('div', { key: 'toolbar', className: 'sd-toolbar' },
+      React.createElement('button', { type: 'button', className: 'sd-link', onClick: () => setSelected(new Set(sessions.map(s => s.sessionId))) }, t2('batch.selectAll')),
+      React.createElement('button', { type: 'button', className: 'sd-link', onClick: () => setSelected(new Set()) }, t2('batch.selectNone')),
+      React.createElement('input', {
+        className: 'sd-days', type: 'number', min: '0', value: ageInput,
+        'aria-label': t2('batch.olderThan'),
+        onChange: event => { setAgeInput(event.target.value) },
+      }),
+      React.createElement('button', { type: 'button', className: 'sd-link', onClick: selectOlder }, t2('batch.olderThan')),
+    ))
+    if (sessions.length === 0) {
+      children.push(React.createElement('div', { key: 'empty', className: 'sd-status' }, t2('batch.empty')))
+    } else {
+      children.push(React.createElement('div', { key: 'list', className: 'sd-list-box', role: 'group', 'aria-label': t2('batch.title') },
+        sessions.map((session) => {
+          const id = session.sessionId
+          return React.createElement('label', { key: id, className: 'sd-row' },
+            React.createElement('input', {
+              type: 'checkbox', className: 'sd-check', checked: selected.has(id),
+              onChange: () => { toggle(id) },
+            }),
+            React.createElement('span', { className: 'sd-row-main' },
+              React.createElement('span', { className: 'sd-row-title' },
+                titleOf(id),
+                session.runningTurn === true ? React.createElement('span', { className: 'sd-badge' }, ` · ${t2('batch.live')}`) : null),
+              React.createElement('span', { className: 'sd-row-meta' },
+                t2('batch.meta').replace('{size}', formatSize(session.sizeBytes)).replace('{time}', formatTime(session.lastActivity)))),
+          )
+        }),
+      ))
+    }
+    children.push(React.createElement('label', { key: 'deep', className: 'sd-deep' },
+      React.createElement('input', { type: 'checkbox', className: 'sd-check', checked: deep, onChange: event => { setDeep(event.target.checked) } }),
+      React.createElement('span', null,
+        React.createElement('strong', { style: { fontWeight: 500 } }, t2('batch.deepLabel')),
+        ` — ${t2('batch.deepHint')}`),
+    ))
+  }
+  if (phase.kind === 'done') {
+    const data = phase.data ?? {}
+    const ok = (data.results ?? []).filter(r => r.ok).length
+    const total = (data.results ?? []).length
+    children.push(React.createElement('div', { key: 'done-title', className: 'sd-name' }, t2('batch.resultTitle')))
+    children.push(React.createElement('div', { key: 'done-sessions', className: 'sd-meta' },
+      t2('batch.resultSessions').replace('{ok}', String(ok)).replace('{total}', String(total)).replace('{size}', formatSize(data.freedBytes))))
+    if (data.attachments !== undefined) {
+      children.push(React.createElement('div', { key: 'done-attachments', className: 'sd-meta' },
+        t2('batch.resultAttachments')
+          .replace('{removed}', String(data.attachments.removed))
+          .replace('{kept}', String(data.attachments.kept))
+          .replace('{size}', formatSize(data.attachments.freedBytes))))
+    }
+    const failed = (data.results ?? []).filter(r => !r.ok)
+    if (failed.length > 0) {
+      children.push(React.createElement('div', { key: 'done-failed', className: 'sd-error' },
+        `${t2('batch.resultFailed')}：${failed.map(r => `${titleOf(r.sessionId)}（${r.code}）`).join('、')}`))
+    }
+  }
+  if (phase.kind === 'error') {
+    children.push(React.createElement('div', { key: 'error', className: 'sd-error', role: 'alert' },
+      `${t2('reason.delete-failed')}${String(phase.message ?? '')}`))
+  }
+
+  return React.createElement(Modal, {
+    open: request !== null,
+    onClose: close,
+    closeLabel: t2('batch.cancel'),
+    title: t2('batch.title'),
+    className: 'sd-batch-dialog',
+    footer,
+  }, ...children)
+}
+
 /** Plugin `apply`: stylesheet, dictionaries, the context-menu entry, and the overlay dialog. */
 function apply(ctx) {
   try {
@@ -465,6 +681,7 @@ function apply(ctx) {
       }
     }
     const request = createSource(null)
+    const batchRequest = createSource(null)
 
     ctx.effect(() => ctx.contextMenus.register({
       id: 'sessionDelete.delete',
@@ -497,6 +714,19 @@ function apply(ctx) {
       }],
     }), 'session-delete: context menu')
 
+    // Workspace menu: batch cleanup sits above the built-in "delete workspace".
+    ctx.effect(() => ctx.contextMenus.register({
+      id: 'sessionDelete.batch',
+      target: 'workspace',
+      order: 200,
+      resolve: (target) => [{
+        id: 'batch',
+        label: t('menu.batchCleanup'),
+        icon: { key: 'workspace.delete' },
+        run: () => { batchRequest.set({ workspaceId: target.workspaceId, displayTitle: target.displayTitle }) },
+      }],
+    }), 'session-delete: workspace batch menu')
+
     ctx.slots.inject('shell.overlay', () => {
       overlayReady = true
       return ctx.slots.register({
@@ -511,6 +741,19 @@ function apply(ctx) {
         }),
       }, DeleteDialog)
     })
+
+    ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+      name: 'shell.overlay',
+      id: 'session-delete.batch',
+      locale: NS,
+      inject: () => ({
+        hooks: { batchRequest },
+        dismiss: () => { batchRequest.set(null) },
+        refreshSessions: () => { void ctx.sessions.refresh() },
+        translate: t,
+        titleOf: (id) => ctx.sessions.list.getSnapshot().byId[id]?.displayTitle ?? id,
+      }),
+    }, BatchDialog))
   } catch (error) {
     console.error('session-delete: client apply failed', error)
     showBanner(`session-delete 客户端加载失败：${error instanceof Error ? error.message : String(error)}`)

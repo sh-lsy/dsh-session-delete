@@ -4,12 +4,13 @@
  * deletion against a real temporary Session directory.
  */
 import assert from 'node:assert/strict'
+import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { apply, deleteSession, inspectSession, resolveConfig } from '../index.js'
+import { apply, batchDelete, batchInspect, deleteSession, inspectSession, resolveConfig } from '../index.js'
 
 const DAY = 86_400_000
 const SESSION = 'session-11111111-2222-3333-4444-555555555555'
@@ -42,9 +43,15 @@ function makeContext(options = {}) {
     sessionPersistence: {
       stat: options.stat ?? (async () => undefined),
       list: options.list ?? (async () => []),
+      open: async (id) => ({
+        id,
+        read: async () => ({ events: options.logs?.[id] ?? [] }),
+        close: async () => {},
+      }),
     },
     workspaceRegistry: {
       list: () => workspaces,
+      get: (id) => workspaces.find(workspace => workspace.id === id),
       get archivedSessionIds() { return [...archived] },
       get pinnedSessionIds() { return [...pinned] },
       archiveSession: async (id) => { archived.add(id) },
@@ -90,10 +97,15 @@ test('resolveConfig validates every field and keeps the documented defaults', ()
   assert.throws(() => resolveConfig({ spillRoots: [''] }), /non-empty strings/u)
 })
 
-test('apply registers two owner-only POST routes', () => {
+test('apply registers four owner-only POST routes', () => {
   const ctx = makeContext()
   apply(ctx, undefined)
-  assert.deepEqual([...ctx.routes.keys()].sort(), ['/session-delete/delete', '/session-delete/inspect'])
+  assert.deepEqual([...ctx.routes.keys()].sort(), [
+    '/session-delete/batch-delete',
+    '/session-delete/batch-inspect',
+    '/session-delete/delete',
+    '/session-delete/inspect',
+  ])
   for (const route of ctx.routes.values()) {
     assert.equal(route.kind, 'exact')
     assert.equal(route.auth, 'required')
@@ -246,6 +258,101 @@ test('a vanished directory is an idempotent success', async () => {
     await rm(directory, { recursive: true, force: true })
     const deleted = await deleteSession(ctx, resolveConfig(undefined), { sessionId: SESSION })
     assert.equal(deleted.ok, true)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+/** One stored snapshot whose header id matches the session it describes. */
+function snapFor(log, id) {
+  const base = snapshot(log)
+  return { ...base, header: { ...base.header, id } }
+}
+
+test('batchInspect lists a workspace sessions and refuses an unknown workspace', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-sd-'))
+  try {
+    const { log } = await sessionDir(root)
+    const workspace = { id: 'w1', path: '/tmp/demo', sessionIds: [SESSION], async detachSession() {} }
+    const ctx = makeContext({ stat: async () => snapshot(log), workspaces: [workspace] })
+    const listed = await batchInspect(ctx, resolveConfig(undefined), 'w1')
+    assert.equal(listed.ok, true)
+    assert.equal(listed.data.sessions.length, 1)
+    assert.equal(listed.data.sessions[0].sessionId, SESSION)
+    assert.equal(listed.data.sessions[0].eligible, true)
+    const missing = await batchInspect(ctx, resolveConfig(undefined), 'nope')
+    assert.equal(missing.code, 'not-found')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('batchDelete removes the selected sessions and keeps the rest', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-sd-'))
+  try {
+    const second = 'session-22222222-2222-3333-4444-555555555555'
+    const a = await sessionDir(root, SESSION)
+    const b = await sessionDir(root, second)
+    const logs = { [SESSION]: a.log, [second]: b.log }
+    const workspace = { id: 'w1', path: '/tmp/demo', sessionIds: [SESSION, second], async detachSession() {} }
+    const ctx = makeContext({
+      workspaces: [workspace],
+      stat: async (id) => snapFor(logs[id], id),
+      list: async () => [SESSION, second].map(id => snapFor(logs[id], id)),
+    })
+    const result = await batchDelete(ctx, resolveConfig(undefined), { sessionIds: [SESSION] })
+    assert.equal(result.ok, true)
+    assert.equal(result.data.results.length, 1)
+    assert.equal(result.data.results[0].ok, true)
+    assert.equal(existsSync(a.directory), false)
+    assert.equal(existsSync(b.directory), true)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('batchDelete deep cleanup reclaims exclusive attachments and keeps shared ones', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-sd-'))
+  try {
+    const hexA = 'a'.repeat(64)
+    const hexB = 'b'.repeat(64)
+    const hexC = 'c'.repeat(64)
+    const s1 = SESSION
+    const s2 = 'session-22222222-2222-3333-4444-555555555555'
+    const s3 = 'session-33333333-2222-3333-4444-555555555555'
+    const dirs = { [s1]: await sessionDir(root, s1), [s2]: await sessionDir(root, s2), [s3]: await sessionDir(root, s3) }
+    const logs = {
+      [s1]: [{ attachment: { attachmentId: `sha256:${hexA}` } }, { attachment: { attachmentId: `sha256:${hexC}` } }],
+      [s2]: [{ attachment: { attachmentId: `sha256:${hexB}` } }],
+      [s3]: [{ attachment: { attachmentId: `sha256:${hexC}` } }],
+    }
+    const attachRoot = join(root, 'attachments', 'v1')
+    for (const hex of [hexA, hexB, hexC]) {
+      const object = join(attachRoot, 'objects', hex.slice(0, 2), hex)
+      await mkdir(join(attachRoot, 'objects', hex.slice(0, 2)), { recursive: true })
+      await writeFile(object, 'bytes')
+    }
+    const workspace = { id: 'w1', path: '/tmp/demo', sessionIds: [s1, s2, s3], async detachSession() {} }
+    const ctx = makeContext({
+      workspaces: [workspace],
+      logs,
+      stat: async (id) => snapFor(dirs[id].log, id),
+      // After deletion the listing reflects only the sessions still on disk.
+      list: async () => [s1, s2, s3].map(id => snapFor(dirs[id].log, id)).filter(s => existsSync(s.location.path)),
+      services: { attachments: { root: attachRoot } },
+    })
+    const result = await batchDelete(ctx, resolveConfig(undefined), { sessionIds: [s1, s2], deepAttachments: true })
+    assert.equal(result.ok, true)
+    assert.equal(result.data.results.filter(r => r.ok).length, 2)
+    assert.equal(existsSync(dirs[s1].directory), false)
+    assert.equal(existsSync(dirs[s2].directory), false)
+    assert.equal(existsSync(dirs[s3].directory), true)
+    // Exclusive attachments gone; the one still referenced by s3 kept.
+    assert.equal(existsSync(join(attachRoot, 'objects', hexA.slice(0, 2), hexA)), false)
+    assert.equal(existsSync(join(attachRoot, 'objects', hexB.slice(0, 2), hexB)), false)
+    assert.equal(existsSync(join(attachRoot, 'objects', hexC.slice(0, 2), hexC)), true)
+    assert.equal(result.data.attachments.removed, 2)
+    assert.equal(result.data.attachments.kept, 1)
   } finally {
     await rm(root, { recursive: true, force: true })
   }

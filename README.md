@@ -63,6 +63,16 @@ The bundle patch mounts one row. Override its `config` in your profile's `cordis
     spillRoots: []                   # extra spill roots beside the discovered dsh-spill-* ones
 ```
 
+## Batch cleanup
+
+The workspace right-click menu gains **Clean up sessions** (above "delete workspace"). It opens a picker listing that workspace's sessions with checkboxes:
+
+- **Select all / Clear**, or **select older than N days** (the age helper lives here, not on a single manual deletion).
+- Each row shows the title, size, last activity, and a running badge.
+- **Deep attachment cleanup** (off by default): after deleting the selected sessions, removes attachment objects that those sessions referenced **and no remaining session references**. Anything still used by another session or at workspace level is kept. This is reference-counted, so shared attachments are never deleted out from under a live session.
+
+Confirming deletes the selected sessions through the same safe path as a single deletion (stop running work, archive, await the turn, remove the directory), then runs the attachment GC and reports deleted counts and freed bytes.
+
 ## Install
 
 ```sh

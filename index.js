@@ -34,6 +34,8 @@ export const inject = ['webServer', 'sessionPersistence', 'workspaceRegistry']
 
 const INSPECT_PATH = '/session-delete/inspect'
 const DELETE_PATH = '/session-delete/delete'
+const BATCH_INSPECT_PATH = '/session-delete/batch-inspect'
+const BATCH_DELETE_PATH = '/session-delete/batch-delete'
 const MAX_BODY_BYTES = 64 * 1024
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,200}$/u
 const SPILL_ROOT = /^dsh-spill-[A-Za-z0-9]{6}$/u
@@ -86,54 +88,65 @@ export function resolveConfig(raw) {
 }
 
 /**
- * Mount the two owner-only routes.
+ * Mount the owner-only routes: single inspect/delete and batch inspect/delete.
  * @param ctx - Host context carrying `webServer`, `sessionPersistence`, and `workspaceRegistry`.
  * @param rawConfig - the row's config object.
  */
 export function apply(ctx, rawConfig) {
   const config = resolveConfig(rawConfig)
-  ctx.effect(() => ctx.webServer.register({
+  const route = (path, run, batch = false) => ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
-    path: INSPECT_PATH,
+    path,
     auth: 'required',
-    handler: (req, res, peer) => serve(req, res, peer, async body => inspectSession(ctx, config, body.sessionId)),
-  }), `session-delete: POST ${INSPECT_PATH}`)
-  ctx.effect(() => ctx.webServer.register({
-    kind: 'exact',
-    path: DELETE_PATH,
-    auth: 'required',
-    handler: (req, res, peer) => serve(req, res, peer, async body => deleteSession(ctx, config, body)),
-  }), `session-delete: POST ${DELETE_PATH}`)
+    handler: (req, res, peer) => (batch ? serveBatch : serve)(req, res, peer, run),
+  }), `session-delete: POST ${path}`)
+  route(INSPECT_PATH, body => inspectSession(ctx, config, body.sessionId))
+  route(DELETE_PATH, body => deleteSession(ctx, config, body))
+  route(BATCH_INSPECT_PATH, body => batchInspect(ctx, config, body.workspaceId), true)
+  route(BATCH_DELETE_PATH, body => batchDelete(ctx, config, body), true)
 }
 
 /**
- * Answer one JSON request with the owner gate, method check, and error mapping.
- * @param req - incoming request.
- * @param res - outgoing response.
- * @param peer - admitted Peer, absent for anonymous requests.
- * @param run - operation over the parsed body.
+ * Owner gate, method gate, and bounded JSON parse shared by every route.
+ * @returns the parsed body, or undefined when a failure response was already sent.
  */
-async function serve(req, res, peer, run) {
+async function admitJson(req, res, peer) {
   if (peer?.principal?.kind !== 'owner') {
     sendJson(res, 403, { ok: false, code: 'forbidden', message: 'owner access required' })
-    return
+    return undefined
   }
   if (req.method !== 'POST') {
     res.setHeader('allow', 'POST')
     sendJson(res, 405, { ok: false, code: 'method-not-allowed', message: 'POST required' })
-    return
+    return undefined
   }
-  let body
   try {
-    body = await readJson(req)
+    return await readJson(req)
   } catch (error) {
     sendJson(res, 400, { ok: false, code: 'bad-request', message: messageOf(error) })
-    return
+    return undefined
   }
+}
+
+/** Answer one single-session route, validating the named sessionId. */
+async function serve(req, res, peer, run) {
+  const body = await admitJson(req, res, peer)
+  if (body === undefined) return
   if (typeof body.sessionId !== 'string' || !SESSION_ID.test(body.sessionId)) {
     sendJson(res, 400, { ok: false, code: 'bad-request', message: 'sessionId is missing or malformed' })
     return
   }
+  try {
+    sendJson(res, 200, await run(body))
+  } catch (error) {
+    sendJson(res, 500, { ok: false, code: 'internal-error', message: messageOf(error) })
+  }
+}
+
+/** Answer one batch route; the operation validates its own body fields. */
+async function serveBatch(req, res, peer, run) {
+  const body = await admitJson(req, res, peer)
+  if (body === undefined) return
   try {
     sendJson(res, 200, await run(body))
   } catch (error) {
@@ -289,6 +302,160 @@ export async function deleteSession(ctx, config, request) {
 function isLive(ctx, sessionId) {
   return ctx.get('sessions')?.get(sessionId) !== undefined
     || ctx.get('agents')?.get(sessionId) !== undefined
+}
+
+/**
+ * List one Workspace's Sessions with their deletion preconditions, for the
+ * batch-cleanup picker. Read-only.
+ * @param ctx - Host context.
+ * @param config - resolved plugin config.
+ * @param workspaceId - the Workspace whose Sessions are listed.
+ * @returns `{ ok, data: { workspaceId, sessions } }` or a refusal.
+ */
+export async function batchInspect(ctx, config, workspaceId) {
+  const workspace = typeof workspaceId === 'string' ? ctx.workspaceRegistry.get(workspaceId) : undefined
+  if (workspace === undefined) {
+    return { ok: false, code: 'not-found', message: `workspace "${String(workspaceId)}" does not exist` }
+  }
+  const sessions = []
+  for (const sessionId of workspace.sessionIds) {
+    const inspected = await inspectSession(ctx, config, sessionId)
+    if (inspected.ok !== true) {
+      sessions.push({ sessionId, eligible: false, reasons: [{ code: inspected.code, message: inspected.message }] })
+      continue
+    }
+    sessions.push({
+      sessionId,
+      sizeBytes: inspected.data.sizeBytes,
+      lastActivity: inspected.data.lastActivity,
+      live: inspected.data.live,
+      runningTurn: inspected.data.runningTurn,
+      eligible: inspected.data.eligible,
+      reasons: inspected.data.reasons,
+    })
+  }
+  return { ok: true, data: { workspaceId, path: workspace.path, sessions } }
+}
+
+/**
+ * Delete several Sessions in one call, then optionally reclaim attachments that
+ * only the deleted Sessions referenced.
+ *
+ * Attachment reclamation is reference-counted: an object is removed only when a
+ * deleted Session referenced it AND no remaining Session does. Anything still
+ * used elsewhere — workspace-level or another Session's — is kept.
+ * @param ctx - Host context.
+ * @param config - resolved plugin config.
+ * @param request - `{ sessionIds: string[], deepAttachments?: boolean }`.
+ * @returns per-session results, freed bytes, and the attachment report.
+ */
+export async function batchDelete(ctx, config, request) {
+  const ids = Array.isArray(request.sessionIds)
+    ? [...new Set(request.sessionIds.filter(id => typeof id === 'string' && SESSION_ID.test(id)))]
+    : []
+  if (ids.length === 0) {
+    return { ok: false, code: 'bad-request', message: 'sessionIds must be a non-empty array of session ids' }
+  }
+  const deep = request.deepAttachments === true
+  const warnings = []
+
+  // Capture the deleted Sessions' attachment references before their logs go.
+  const deletedRefs = new Set()
+  if (deep) {
+    for (const id of ids) for (const hex of await refsOfSession(ctx, id)) deletedRefs.add(hex)
+  }
+
+  const results = []
+  let freedBytes = 0
+  for (const sessionId of ids) {
+    const outcome = await deleteSession(ctx, config, { sessionId, stopActivity: true, acknowledged: true })
+    if (outcome.ok === true) {
+      freedBytes += outcome.data.bytes ?? 0
+      results.push({ sessionId, ok: true, bytes: outcome.data.bytes ?? null })
+    } else {
+      results.push({ sessionId, ok: false, code: outcome.code, message: outcome.message })
+    }
+  }
+
+  let attachments = { removed: 0, kept: 0, freedBytes: 0 }
+  if (deep) {
+    const remainingRefs = new Set()
+    for (const snapshot of await ctx.sessionPersistence.list()) {
+      for (const hex of await refsOfSession(ctx, snapshot.header.id)) remainingRefs.add(hex)
+    }
+    const reclaimable = new Set([...deletedRefs].filter(hex => !remainingRefs.has(hex)))
+    attachments = await reclaimAttachments(ctx, reclaimable, warnings)
+    attachments.kept = deletedRefs.size - reclaimable.size
+  }
+
+  ctx.logger.info('session-delete: batch removed %d/%d sessions (%d bytes), attachments %j',
+    results.filter(r => r.ok).length, ids.length, freedBytes, attachments)
+  return { ok: true, data: { results, freedBytes, attachments, warnings } }
+}
+
+/**
+ * Every attachment sha256 referenced by one Session's log.
+ *
+ * Reads the decoded log and extracts content-addressed ids; an unreadable or
+ * absent Session contributes nothing. Matching over text is conservative: a
+ * hash mentioned only as prose still counts as a reference, which keeps an
+ * object rather than risking a wrong deletion.
+ * @param ctx - Host context.
+ * @param sessionId - the Session whose references are collected.
+ * @returns the set of 64-hex attachment digests.
+ */
+async function refsOfSession(ctx, sessionId) {
+  const refs = new Set()
+  let handle
+  try {
+    handle = await ctx.sessionPersistence.open(sessionId, 'read')
+    const { events } = await handle.read()
+    for (const match of JSON.stringify(events).matchAll(/sha256:([a-f0-9]{64})/gu)) refs.add(match[1])
+  } catch {
+    // A Session that cannot be read contributes no references.
+  } finally {
+    await handle?.close().catch(() => {})
+  }
+  return refs
+}
+
+/**
+ * Remove content-addressed attachment objects no remaining Session references.
+ * @param ctx - Host context.
+ * @param reclaimable - the 64-hex digests proven unreferenced by remaining Sessions.
+ * @param warnings - sink for non-fatal removal failures.
+ * @returns counts and freed bytes (alias hardlinks are not double counted).
+ */
+async function reclaimAttachments(ctx, reclaimable, warnings) {
+  const root = ctx.get('attachments')?.root
+  if (root === undefined || reclaimable.size === 0) return { removed: 0, kept: 0, freedBytes: 0 }
+  let removed = 0
+  let freedBytes = 0
+  for (const hex of reclaimable) {
+    const bucket = hex.slice(0, 2)
+    // The normalized image and the verbatim file object hold the real bytes;
+    // the files/ tree is hardlinked aliases, removed without counting bytes.
+    const dataPaths = [join(root, 'objects', bucket, hex), join(root, 'file-objects', bucket, hex)]
+    const aliasPath = join(root, 'files', bucket, hex)
+    let touched = false
+    for (const path of dataPaths) {
+      try {
+        const identity = await stat(path)
+        await rm(path, { force: true })
+        freedBytes += identity.size
+        touched = true
+      } catch (error) {
+        if (error?.code !== 'ENOENT') warnings.push(`attachment ${hex}: ${messageOf(error)}`)
+      }
+    }
+    try {
+      await rm(aliasPath, { recursive: true, force: true })
+    } catch (error) {
+      if (error?.code !== 'ENOENT') warnings.push(`attachment alias ${hex}: ${messageOf(error)}`)
+    }
+    if (touched) removed++
+  }
+  return { removed, kept: 0, freedBytes }
 }
 
 /**
