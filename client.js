@@ -739,7 +739,7 @@ const UNDO_DICT = {
   zh: {
     'action.undo': '回退此轮',
     'dialog.title': '回退此轮对话',
-    'dialog.warning': '将把文件还原到这一轮之前，并分叉一个继续会话；这一轮及之后的文件改动会被还原，原会话保留',
+    'dialog.warning': '将把文件还原到这一轮之前，并继续到一个新会话；这一轮及之后的文件改动会被还原，原会话收进归档（可恢复）',
     'dialog.cancel': '取消',
     'dialog.confirm': '回退',
     'dialog.working': '正在回退…',
@@ -757,7 +757,7 @@ const UNDO_DICT = {
   en: {
     'action.undo': 'Undo this turn',
     'dialog.title': 'Undo this turn',
-    'dialog.warning': 'Reverts files to before this turn and forks a continuation session; file changes from this turn onward are reverted, the original session is kept',
+    'dialog.warning': 'Reverts files to before this turn and continues in a new session; changes from this turn onward are reverted, and the original session is archived (recoverable)',
     'dialog.cancel': 'Cancel',
     'dialog.confirm': 'Undo',
     'dialog.working': 'Undoing…',
@@ -794,19 +794,24 @@ function UndoAction(props) {
     }, React.createElement(UndoIcon)))
 }
 
-/** Restore the prompt to a session's composer once its scope is retained. */
+/** Restore the prompt to a session's composer once its shell is ready. */
 function prefillDraft(ctx, sessionId, prompt) {
   if (prompt === '') return
   let tries = 0
   const attempt = () => {
-    const actx = ctx.sessions.scope?.(sessionId)
-    if (actx !== undefined) {
-      try {
+    try {
+      const binding = ctx.sessions.binding(sessionId)
+      if (binding !== undefined) {
+        const result = ctx.uiConversation.input.requestDraftInitialization(binding, { prompt, clearPreviousDraft: true })
+        if (result === 'applied') return
+      }
+      const actx = ctx.sessions.scope?.(sessionId)
+      if (actx !== undefined) {
         ctx.uiConversation.input.for(actx).setDraft(prompt)
         return
-      } catch { /* fall through to retry */ }
-    }
-    if (tries++ < 25) setTimeout(attempt, 100)
+      }
+    } catch { /* retry until the session shell is ready */ }
+    if (tries++ < 50) setTimeout(attempt, 100)
   }
   attempt()
 }
@@ -835,6 +840,11 @@ async function runUndo(ctx, request) {
   }
   ctx.uiWorkspace.openSession(childId)
   prefillDraft(ctx, childId, prompt)
+  // In-place feel: the continuation becomes the visible session; the original
+  // (holding the discarded turns) is archived and stays recoverable from archive.
+  try {
+    await ctx.uiWorkspace.archiveSession(request.sessionId, { stopActivity: true })
+  } catch { /* best-effort; the fork already succeeded */ }
   return { ok: true, turn, childId }
 }
 
