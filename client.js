@@ -387,7 +387,11 @@ const styles = {
 
 /** The confirmation dialog; it owns the request lifecycle for one session at a time. */
 function DeleteDialog(props) {
-  const request = typeof props.useRequest === 'function' ? props.useRequest() : null
+  // The renderer binds every `hooks` source to a SELECTOR hook: it must be
+  // called with a selection function, exactly like the built-in dialogs
+  // (`useArchiveRequest(pending => pending)`). A bare call throws inside
+  // useSyncExternalStoreWithSelector and the dialog never renders.
+  const request = typeof props.useRequest === 'function' ? props.useRequest(state => state) : null
   if (request !== null) dialogRendered = true
   const [phase, setPhase] = React.useState({ kind: 'idle' })
   const [typed, setTyped] = React.useState('')
