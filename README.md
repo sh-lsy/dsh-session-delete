@@ -76,6 +76,15 @@ The bundle patch mounts one row. Override its `config` in your profile's `cordis
     timeoutMs: 30000                 # per-git-command timeout for undo snapshots
     outputMaxBytes: 8388608          # git output cap for undo snapshots
     dataRoot: ''                     # undo data root; empty = ~/.dsh/session-undo
+    snapshotExcludes:                # heavy dirs kept out of undo snapshots
+      - node_modules/
+      - .git/
+      - __pycache__/
+      - .venv/
+      - venv/
+      - .next/
+      - .cache/
+      - .turbo/
 ```
 
 ## Batch cleanup
@@ -107,9 +116,13 @@ non-ignored files added after the snapshot are removed. Ignored files
 A safety snapshot is taken before reverting, a running turn is refused
 (`session-busy`), and undo asks for confirmation first.
 
-Limits: **git workspaces only** in this version (a non-git turn has no snapshot,
-`no-snapshot`); snapshots are recorded from install onward and purged after
-`retentionDays`; subagent sessions are not snapshotted.
+Snapshots use a **shadow git repository** under the plugin data root (the
+opencode approach), so undo works for **git and non-git workspaces alike** and
+never touches your own repository. A workspace's `.gitignore` is respected, plus
+`snapshotExcludes` (heavy dirs like `node_modules`). Limits: snapshots are
+recorded from install/restart onward and purged after `retentionDays`; subagent
+sessions are not snapshotted; a nested directory that is itself a git repo is
+recorded as a gitlink, not file-by-file.
 
 ## Install
 
@@ -135,12 +148,14 @@ Both require `peer.principal.kind === 'owner'`. The Web half (`client.js`) is a 
 - A live Session's in-memory object stays attached after deletion (Harness has no public eviction API). It is archived, so it runs no further turn and appends nothing; the sidebar row is removed on refresh. The orphan is released when the process exits.
 - A deleted Session's id stays in the Workspace registry's in-memory header index until the next start; the row is removed immediately and the stale index entry is unreachable from the UI.
 - Lineage: deleting a Session that other Sessions forked from leaves their `parentSession` pointing at nothing. The dialog warns with the child count; only the displayed lineage is affected.
-- Batch cleanup and automatic retention are not implemented. An age threshold would apply there, not to a manual deletion.
+- Undo snapshots start at install/restart; earlier turns have none. A nested directory that is itself a git repo is snapshotted as a gitlink, not file-by-file. Undo rewinds by forking (the original session is kept), not in-place truncation.
+- The undo icon sits in the assistant message action strip (beside copy); the user-message icon row has no plugin slot.
 
 ## Development
 
 ```sh
-node tests/host.test.mjs      # Host-half behaviour; no build, no network
+node tests/host.test.mjs      # delete / batch (13 tests)
+node tests/undo.test.mjs      # undo, incl. real git and non-git restore safety (7 tests)
 ```
 
 `node --test tests/` spawns a child process per file, which some sandboxes block; running the file directly keeps the run in-process.

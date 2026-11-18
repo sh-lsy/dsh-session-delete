@@ -63,7 +63,7 @@
 
 文件还原是保守的：`checkout-index -a -f` 还原快照里的每个文件（改动的还原、被删的重建），只删除「快照之后新增、且 git 不忽略」的文件。**忽略文件（node_modules、构建产物、被 .gitignore 匹配的 .env）绝不动**。还原前先打安全快照；运行中的轮次拒绝（`session-busy`）；需二次确认。
 
-限制：本版**仅 git 工作区**（非 git 轮次无快照，提示 `no-snapshot`）；快照从安装/重启后开始记录，按 `retentionDays` 清理；子代理会话不打快照。
+快照采用**影子 git 仓库**（opencode 的做法），建在插件数据目录下，因此 **git 与非 git 工作区都能撤销**，且绝不碰你自己的仓库。会尊重工作区的 `.gitignore`，外加 `snapshotExcludes`（node_modules 等重目录）。限制：快照从安装/重启后开始记录、按 `retentionDays` 清理；子代理会话不打快照；本身是 git 仓库的嵌套目录按 gitlink 记录（不逐文件）。
 
 ## 配置
 
@@ -82,6 +82,15 @@ bundle 补丁挂载一行。在 profile 的 `cordis.patch.yml` 覆盖其 `config
     timeoutMs: 30000                 # 撤销快照的单条 git 命令超时
     outputMaxBytes: 8388608          # 撤销快照的 git 输出上限
     dataRoot: ''                     # 撤销数据根；空 = ~/.dsh/session-undo
+    snapshotExcludes:                # 撤销快照排除的重目录
+      - node_modules/
+      - .git/
+      - __pycache__/
+      - .venv/
+      - venv/
+      - .next/
+      - .cache/
+      - .turbo/
 ```
 
 ## 安装
@@ -100,15 +109,15 @@ dsh plugin install <本目录的绝对路径>
 ## 已知限制
 
 - 共享附件默认不删（官方无引用计数回收）；深度清理仅删无人引用者。
-- 撤销仅 git 工作区；快照自安装/重启起记录。
+- 撤销用影子 git 仓库，git/非 git 工作区均可；快照自安装/重启起记录；嵌套 git 目录按 gitlink 记录。
 - 回退是分叉（原会话保留），非原地截断——由 DSH 日志模型决定。
-- 撤销图标经插件槽位于复制**右侧**（复制与分叉之间）；严格「复制左侧」需改官方组件一行。
+- 撤销图标在**助手消息**操作条（复制旁）；用户消息图标行无插件槽。
 
 ## 开发
 
 ```sh
 node tests/host.test.mjs   # 删除/批量（13 项）
-node tests/undo.test.mjs   # 撤销，含真实 git 仓库还原安全测试（6 项）
+node tests/undo.test.mjs   # 撤销，含真实 git 与非 git 还原安全测试（7 项）
 ```
 
 ## 许可

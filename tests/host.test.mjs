@@ -93,6 +93,7 @@ test('resolveConfig validates every field and keeps the documented defaults', ()
     timeoutMs: 30000,
     outputMaxBytes: 8388608,
     dataRoot: '',
+    snapshotExcludes: ['node_modules/', '.git/', '__pycache__/', '.venv/', 'venv/', '.next/', '.cache/', '.turbo/'],
   })
   assert.equal(resolveConfig({ requireTitleConfirmation: true }).requireTitleConfirmation, true)
   assert.equal(resolveConfig({ stopSettleMs: 0 }).stopSettleMs, 0)

@@ -14,9 +14,10 @@
  * @module @sh-lsy/dsh-session-delete/undo-host
  */
 import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join, relative, resolve, sep } from 'node:path'
+import { join } from 'node:path'
 
 const PREPARE_PATH = '/session-undo/prepare'
 const SNAPSHOTS_PATH = '/session-undo/snapshots'
@@ -24,6 +25,9 @@ const PURGE_PATH = '/session-undo/purge'
 const DAY_MS = 86_400_000
 const STDERR_TAIL_BYTES = 16 * 1024
 const TERMINATE_GRACE_MS = 2_000
+
+/** Heavy regenerable directories kept out of snapshots by default (shadow info/exclude). */
+const DEFAULT_EXCLUDES = ['node_modules/', '.git/', '__pycache__/', '.venv/', 'venv/', '.next/', '.cache/', '.turbo/']
 
 /** Undo defaults merged into the plugin row config. */
 export function undoDefaults() {
@@ -33,6 +37,7 @@ export function undoDefaults() {
     timeoutMs: 30_000,
     outputMaxBytes: 8 * 1024 * 1024,
     dataRoot: '',
+    snapshotExcludes: [...DEFAULT_EXCLUDES],
   }
 }
 
@@ -51,12 +56,17 @@ export function resolveUndoConfig(raw) {
   if (typeof snapshotEnabled !== 'boolean') throw new TypeError('session-delete: config.snapshotEnabled must be a boolean')
   const dataRoot = raw.dataRoot ?? base.dataRoot
   if (typeof dataRoot !== 'string') throw new TypeError('session-delete: config.dataRoot must be a string')
+  const snapshotExcludes = raw.snapshotExcludes ?? base.snapshotExcludes
+  if (!Array.isArray(snapshotExcludes) || snapshotExcludes.some(item => typeof item !== 'string')) {
+    throw new TypeError('session-delete: config.snapshotExcludes must be an array of strings')
+  }
   return {
     snapshotEnabled,
     retentionDays: num('retentionDays', 0),
     timeoutMs: num('timeoutMs', 1),
     outputMaxBytes: num('outputMaxBytes', 1),
     dataRoot,
+    snapshotExcludes: [...snapshotExcludes],
   }
 }
 
@@ -92,19 +102,26 @@ export async function runGit(ctx, config, executable, args, options) {
   return { exitCode: outcome.exitCode, stdout: stdout.text, stderr }
 }
 
-/** Locate the git workspace enclosing cwd with a persistent private object store. */
+/**
+ * Address a persistent shadow git repository for the workspace (opencode-style).
+ *
+ * The shadow repo lives under the plugin data root, never in the workspace, so
+ * snapshots work for git and non-git workspaces alike and never touch the user's
+ * own repository. Heavy regenerable directories are excluded via info/exclude.
+ * @returns workspace facts whose env points git at the shadow dir + work tree.
+ */
 export async function locateWorkspace(ctx, config, executable, cwd, signal) {
-  const found = await runGit(ctx, config, executable, ['rev-parse', '--show-toplevel', '--absolute-git-dir', '--git-path', 'objects'], { cwd, signal })
-  if (found.exitCode !== 0) return null
-  const lines = found.stdout.split('\n').map(line => resolve(cwd, line))
-  const [root, gitDir, repositoryObjects] = lines
-  if (root === undefined || gitDir === undefined || repositoryObjects === undefined) return null
-  const objects = join(dataRootOf(config), 'objects', storeName(cwd))
-  await mkdir(objects, { recursive: true })
-  const inside = objects === root || objects.startsWith(root + sep)
-  const excludes = inside ? [relative(root, objects).split(sep).join('/')] : []
-  const env = { GIT_OBJECT_DIRECTORY: objects, GIT_ALTERNATE_OBJECT_DIRECTORIES: repositoryObjects }
-  return { root, gitDir, objects, env, excludes }
+  const gitDir = join(dataRootOf(config), 'snapshot', storeName(cwd))
+  await mkdir(gitDir, { recursive: true })
+  if (!existsSync(join(gitDir, 'HEAD'))) {
+    const init = await runGit(ctx, config, executable, ['init', '--bare', '-q'], { cwd: gitDir, signal })
+    if (init.exitCode !== 0) throw new Error(`git init shadow failed: ${init.stderr.trim()}`)
+    await runGit(ctx, config, executable, ['config', 'core.bare', 'false'], { cwd: gitDir, env: { GIT_DIR: gitDir }, signal })
+    await mkdir(join(gitDir, 'info'), { recursive: true })
+    await writeFile(join(gitDir, 'info', 'exclude'), `${config.snapshotExcludes.join('\n')}\n`)
+  }
+  const env = { GIT_DIR: gitDir, GIT_WORK_TREE: cwd }
+  return { root: cwd, gitDir, objects: join(gitDir, 'objects'), env, excludes: [] }
 }
 
 /** Write the complete work tree (untracked and modified, not ignored) as a tree object. */
