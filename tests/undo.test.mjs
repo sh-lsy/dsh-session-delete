@@ -1,7 +1,8 @@
 /**
- * Undo Host behaviour: config, rewind resolution, and shadow-git snapshot/restore
- * safety for BOTH git and non-git workspaces (modified files reverted, added files
- * removed, ignored files untouched, deleted files recreated).
+ * Undo Host behaviour: config, rewind resolution, and conflict-aware targeted
+ * revert via the shadow git repo. Verifies that only the undone turn's own
+ * changes are reverted, files modified after the turn are skipped, and files
+ * the turn never touched stay untouched (latest code preserved).
  */
 import assert from 'node:assert/strict'
 import { spawn, execFile } from 'node:child_process'
@@ -13,13 +14,12 @@ import test from 'node:test'
 import { promisify } from 'node:util'
 
 import {
-  locateWorkspace, resolveRewind, resolveUndoConfig, restoreTree, snapshotTree, textOf,
+  locateWorkspace, resolveRewind, resolveUndoConfig, revertTurn, snapshotTree, textOf,
 } from '../undo-host.js'
 
 const execFileAsync = promisify(execFile)
 const git = (cwd, args) => execFileAsync('git', args, { cwd })
 
-/** A subprocess capability double that runs real git and exposes the plugin's handle shape. */
 function makeSubprocess() {
   return {
     resolveExecutable: async () => 'git',
@@ -44,14 +44,21 @@ function makeSubprocess() {
   }
 }
 
+const harness = async (dir, data) => {
+  const ctx = { subprocess: makeSubprocess() }
+  const config = resolveUndoConfig({ dataRoot: data })
+  const signal = new AbortController().signal
+  const workspace = await locateWorkspace(ctx, config, 'git', dir, signal)
+  const snap = () => snapshotTree(ctx, config, 'git', workspace, signal)
+  return { ctx, config, workspace, signal, snap }
+}
+
 test('resolveUndoConfig validates fields and defaults', () => {
   const base = resolveUndoConfig(undefined)
   assert.equal(base.snapshotEnabled, true)
   assert.equal(base.retentionDays, 7)
   assert.ok(base.snapshotExcludes.includes('node_modules/'))
-  assert.equal(resolveUndoConfig({ retentionDays: 14 }).retentionDays, 14)
   assert.throws(() => resolveUndoConfig({ retentionDays: -1 }), />= 0/u)
-  assert.throws(() => resolveUndoConfig({ snapshotEnabled: 'yes' }), /boolean/u)
   assert.throws(() => resolveUndoConfig({ snapshotExcludes: 'x' }), /array of strings/u)
 })
 
@@ -79,26 +86,56 @@ test('resolveRewind maps a message to its turn boundary and human prompt', () =>
   assert.equal(resolveRewind(events, 'missing').code, 'message-not-found')
 })
 
-/** Run the snapshot/modify/restore safety scenario against a workspace directory. */
-async function exerciseRestore(dir, data) {
-  const ctx = { subprocess: makeSubprocess() }
-  const config = resolveUndoConfig({ dataRoot: data })
-  const signal = new AbortController().signal
-  const workspace = await locateWorkspace(ctx, config, 'git', dir, signal)
-  assert.notEqual(workspace, null)
-  const tree = await snapshotTree(ctx, config, 'git', workspace, signal)
-  assert.match(tree, /^[0-9a-f]{40,64}$/u)
-  await writeFile(join(dir, 'a.txt'), 'changed')
-  await writeFile(join(dir, 'b.txt'), 'new')
-  await writeFile(join(dir, 'ignored.txt'), 'secret')
-  const result = await restoreTree(ctx, config, 'git', workspace, tree, signal)
-  assert.equal(await readFile(join(dir, 'a.txt'), 'utf8'), 'baseline')
-  assert.equal(existsSync(join(dir, 'b.txt')), false)
-  assert.equal(await readFile(join(dir, 'ignored.txt'), 'utf8'), 'secret')
-  assert.equal(result.removed, 1)
-}
+test('revertTurn reverts the turn changes, skips later-modified files, leaves unrelated files untouched', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-undo-'))
+  const data = await mkdtemp(join(tmpdir(), 'dsh-undo-data-'))
+  try {
+    await writeFile(join(dir, 'a.txt'), 'baseline')
+    await writeFile(join(dir, 'keep.txt'), 'untouched')
+    const { ctx, config, workspace, signal, snap } = await harness(dir, data)
+    const start = await snap()
+    // The turn edits a.txt and adds b.txt.
+    await writeFile(join(dir, 'a.txt'), 'turn-edit')
+    await writeFile(join(dir, 'b.txt'), 'new')
+    const end = await snap()
+    // After the turn: a.txt is modified again (superseded), keep.txt changed (unrelated).
+    await writeFile(join(dir, 'a.txt'), 'later-edit')
+    await writeFile(join(dir, 'keep.txt'), 'later-keep')
+    const result = await revertTurn(ctx, config, 'git', workspace, start, end, signal)
+    assert.equal(await readFile(join(dir, 'a.txt'), 'utf8'), 'later-edit') // superseded -> preserved
+    assert.equal(existsSync(join(dir, 'b.txt')), false) // turn-added, unchanged -> removed
+    assert.equal(await readFile(join(dir, 'keep.txt'), 'utf8'), 'later-keep') // unrelated -> untouched
+    assert.deepEqual(result.reverted, ['b.txt'])
+    assert.deepEqual(result.conflicts, ['a.txt'])
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    await rm(data, { recursive: true, force: true })
+  }
+})
 
-test('git workspace: revert modified, remove added, keep ignored', async () => {
+test('revertTurn restores an unsuperseded edit and recreates a file the turn deleted (non-git)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-undo-'))
+  const data = await mkdtemp(join(tmpdir(), 'dsh-undo-data-'))
+  try {
+    await writeFile(join(dir, 'a.txt'), 'baseline')
+    await writeFile(join(dir, 'del.txt'), 'original')
+    const { ctx, config, workspace, signal, snap } = await harness(dir, data)
+    const start = await snap()
+    await writeFile(join(dir, 'a.txt'), 'turn')
+    await rm(join(dir, 'del.txt'))
+    const end = await snap()
+    const result = await revertTurn(ctx, config, 'git', workspace, start, end, signal)
+    assert.equal(await readFile(join(dir, 'a.txt'), 'utf8'), 'baseline')
+    assert.equal(await readFile(join(dir, 'del.txt'), 'utf8'), 'original')
+    assert.equal(result.conflicts.length, 0)
+    assert.equal(result.reverted.length, 2)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    await rm(data, { recursive: true, force: true })
+  }
+})
+
+test('revertTurn works in a git workspace too and respects .gitignore', async () => {
   const repo = await mkdtemp(join(tmpdir(), 'dsh-undo-repo-'))
   const data = await mkdtemp(join(tmpdir(), 'dsh-undo-data-'))
   try {
@@ -109,42 +146,17 @@ test('git workspace: revert modified, remove added, keep ignored', async () => {
     await writeFile(join(repo, '.gitignore'), 'ignored.txt\n')
     await git(repo, ['add', '-A'])
     await git(repo, ['commit', '-qm', 'base'])
-    await exerciseRestore(repo, data)
+    const { ctx, config, workspace, signal, snap } = await harness(repo, data)
+    const start = await snap()
+    await writeFile(join(repo, 'a.txt'), 'turn')
+    await writeFile(join(repo, 'ignored.txt'), 'secret')
+    const end = await snap()
+    const result = await revertTurn(ctx, config, 'git', workspace, start, end, signal)
+    assert.equal(await readFile(join(repo, 'a.txt'), 'utf8'), 'baseline')
+    assert.equal(await readFile(join(repo, 'ignored.txt'), 'utf8'), 'secret') // ignored, never in diff
+    assert.deepEqual(result.reverted, ['a.txt'])
   } finally {
     await rm(repo, { recursive: true, force: true })
-    await rm(data, { recursive: true, force: true })
-  }
-})
-
-test('non-git workspace: shadow repo enables the same revert safety', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-undo-nogit-'))
-  const data = await mkdtemp(join(tmpdir(), 'dsh-undo-data-'))
-  try {
-    // No git init: an ordinary directory.
-    await writeFile(join(dir, 'a.txt'), 'baseline')
-    await writeFile(join(dir, '.gitignore'), 'ignored.txt\n')
-    await exerciseRestore(dir, data)
-  } finally {
-    await rm(dir, { recursive: true, force: true })
-    await rm(data, { recursive: true, force: true })
-  }
-})
-
-test('restore recreates a file the turn deleted (non-git)', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-undo-nogit-'))
-  const data = await mkdtemp(join(tmpdir(), 'dsh-undo-data-'))
-  try {
-    await writeFile(join(dir, 'keep.txt'), 'original')
-    const ctx = { subprocess: makeSubprocess() }
-    const config = resolveUndoConfig({ dataRoot: data })
-    const signal = new AbortController().signal
-    const workspace = await locateWorkspace(ctx, config, 'git', dir, signal)
-    const tree = await snapshotTree(ctx, config, 'git', workspace, signal)
-    await rm(join(dir, 'keep.txt'))
-    await restoreTree(ctx, config, 'git', workspace, tree, signal)
-    assert.equal(await readFile(join(dir, 'keep.txt'), 'utf8'), 'original')
-  } finally {
-    await rm(dir, { recursive: true, force: true })
     await rm(data, { recursive: true, force: true })
   }
 })

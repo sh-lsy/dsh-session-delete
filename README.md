@@ -102,24 +102,25 @@ Confirming deletes the selected sessions through the same safe path as a single 
 An undo icon (↶) appears in each assistant message's action strip, beside copy.
 Confirming it:
 
-1. **Reverts files** to the state at the start of that turn, from a persistent
-   git working-tree snapshot recorded at every turn start.
-2. **Forks a continuation session** inheriting every earlier turn. DSH's session
-   log is append-only, so rewind is a fork rather than an in-place truncation;
-   the original session is kept.
+1. **Reverts the files that turn changed** — and only those. Each turn records a
+   start and end snapshot; undo diffs them to find the turn's own changes, then
+   reverts a file only if its current content still matches the turn's end state.
+2. **Forks a continuation session** inheriting every earlier turn, opens it, and
+   **deletes the original session** (the undone turns). DSH's log is append-only,
+   so rewind is a fork rather than an in-place truncation; deleting the original
+   keeps a single continuing session and avoids disk accumulation.
 3. **Restores the prompt** of the undone turn to the new session's composer.
 
-File revert is conservative: `checkout-index -a -f` restores every file the
-snapshot holds (modified files reverted, deleted files recreated), and only
-non-ignored files added after the snapshot are removed. Ignored files
-(`node_modules`, build output, `.env` matched by `.gitignore`) are never touched.
-A safety snapshot is taken before reverting, a running turn is refused
-(`session-busy`), and undo asks for confirmation first.
+**Your latest code is safe.** A file modified *after* the undone turn is skipped
+and reported as a conflict (left untouched); a file the turn never touched is
+never modified. So undoing an old turn never clobbers newer work. The result
+dialog reports how many files were reverted and how many were skipped.
 
 Snapshots use a **shadow git repository** under the plugin data root (the
 opencode approach), so undo works for **git and non-git workspaces alike** and
 never touches your own repository. A workspace's `.gitignore` is respected, plus
-`snapshotExcludes` (heavy dirs like `node_modules`). Limits: snapshots are
+`snapshotExcludes` (heavy dirs like `node_modules`). A running turn is refused
+(`session-busy`); undo asks for confirmation first. Limits: snapshots are
 recorded from install/restart onward and purged after `retentionDays`; subagent
 sessions are not snapshotted; a nested directory that is itself a git repo is
 recorded as a gitlink, not file-by-file.
@@ -148,7 +149,7 @@ Both require `peer.principal.kind === 'owner'`. The Web half (`client.js`) is a 
 - A live Session's in-memory object stays attached after deletion (Harness has no public eviction API). It is archived, so it runs no further turn and appends nothing; the sidebar row is removed on refresh. The orphan is released when the process exits.
 - A deleted Session's id stays in the Workspace registry's in-memory header index until the next start; the row is removed immediately and the stale index entry is unreachable from the UI.
 - Lineage: deleting a Session that other Sessions forked from leaves their `parentSession` pointing at nothing. The dialog warns with the child count; only the displayed lineage is affected.
-- Undo snapshots start at install/restart; earlier turns have none. A nested directory that is itself a git repo is snapshotted as a gitlink, not file-by-file. Undo rewinds by forking (the original session is kept), not in-place truncation.
+- Undo snapshots start at install/restart; earlier turns have none. A nested directory that is itself a git repo is snapshotted as a gitlink, not file-by-file. Undo rewinds by forking then deleting the original session (not in-place truncation); the undone turns are discarded permanently (no redo). Only the turn's own changes are reverted; files modified afterward are skipped.
 - The undo icon sits in the assistant message action strip (beside copy); the user-message icon row has no plugin slot.
 
 ## Development

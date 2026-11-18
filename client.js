@@ -739,13 +739,15 @@ const UNDO_DICT = {
   zh: {
     'action.undo': '回退此轮',
     'dialog.title': '回退此轮对话',
-    'dialog.warning': '将把文件还原到这一轮之前，并继续到一个新会话；这一轮及之后的文件改动会被还原，原会话收进归档（可恢复）',
+    'dialog.warning': '将还原这一轮改过的文件（该轮之后被改过的文件会跳过、不动），继续到一个新会话并删除原会话；不影响你最新的其他改动',
     'dialog.cancel': '取消',
     'dialog.confirm': '回退',
     'dialog.working': '正在回退…',
     'dialog.done': '完成',
     'dialog.doneTitle': '已回退',
     'dialog.doneDesc': '已打开继续会话，提示词已放回输入框',
+    'dialog.doneReverted': '已还原 {n} 个文件',
+    'dialog.doneConflicts': '{n} 个文件在该轮之后被修改过，已跳过、未改动',
     'dialog.failed': '回退失败：',
     'reason.session-busy': '该会话正在运行轮次，请先停止再回退',
     'reason.no-snapshot': '这一轮没有文件快照（快照未启用、已过期，或该轮在插件启用前）',
@@ -757,13 +759,15 @@ const UNDO_DICT = {
   en: {
     'action.undo': 'Undo this turn',
     'dialog.title': 'Undo this turn',
-    'dialog.warning': 'Reverts files to before this turn and continues in a new session; changes from this turn onward are reverted, and the original session is archived (recoverable)',
+    'dialog.warning': 'Reverts the files this turn changed (files modified after this turn are skipped, untouched), continues in a new session and deletes the original; your other latest changes are not affected',
     'dialog.cancel': 'Cancel',
     'dialog.confirm': 'Undo',
     'dialog.working': 'Undoing…',
     'dialog.done': 'Done',
     'dialog.doneTitle': 'Undone',
     'dialog.doneDesc': 'Opened the continuation session with the prompt restored to the composer',
+    'dialog.doneReverted': 'Reverted {n} file(s)',
+    'dialog.doneConflicts': '{n} file(s) were modified after this turn and were skipped (untouched)',
     'dialog.failed': 'Undo failed: ',
     'reason.session-busy': 'The session is running a turn; stop it before undoing',
     'reason.no-snapshot': 'No file snapshot for this turn (snapshots disabled, expired, or the turn predates the plugin)',
@@ -840,12 +844,14 @@ async function runUndo(ctx, request) {
   }
   ctx.uiWorkspace.openSession(childId)
   prefillDraft(ctx, childId, prompt)
-  // In-place feel: the continuation becomes the visible session; the original
-  // (holding the discarded turns) is archived and stays recoverable from archive.
+  // Option 1: discard the original session (the undone turns) so the sidebar
+  // keeps a single continuing session and disk does not accumulate. Workspace
+  // files are untouched by session deletion; only the snapshot revert above
+  // changed files, and it skipped anything modified after the turn.
   try {
-    await ctx.uiWorkspace.archiveSession(request.sessionId, { stopActivity: true })
+    await post('/session-delete/delete', { sessionId: request.sessionId, stopActivity: true, acknowledged: true })
   } catch { /* best-effort; the fork already succeeded */ }
-  return { ok: true, turn, childId }
+  return { ok: true, turn, childId, reverted: prepared.data.reverted ?? [], conflicts: prepared.data.conflicts ?? [] }
 }
 
 /** The undo confirmation dialog hosted in shell.overlay. */
@@ -864,7 +870,9 @@ function UndoDialog(props) {
     if (request === null || phase.kind === 'working') return
     setPhase({ kind: 'working' })
     const result = await props.confirmUndo(request)
-    setPhase(result?.ok === true ? { kind: 'done', turn: result.turn } : { kind: 'error', code: result?.code, message: result?.message })
+    setPhase(result?.ok === true
+      ? { kind: 'done', turn: result.turn, reverted: result.reverted ?? [], conflicts: result.conflicts ?? [] }
+      : { kind: 'error', code: result?.code, message: result?.message })
   }
   const footer = (() => {
     if (phase.kind === 'done') return React.createElement(Button, { variant: 'primary', className: 'su-btn-confirm', onClick: close }, t2('dialog.done'))
@@ -878,6 +886,12 @@ function UndoDialog(props) {
   if (phase.kind === 'done') {
     children.push(React.createElement('div', { key: 'done-title', className: 'su-text', style: { fontWeight: 500, color: 'var(--dsw-alias-label-primary)' } }, t2('dialog.doneTitle')))
     children.push(React.createElement('div', { key: 'done-desc', className: 'su-text' }, t2('dialog.doneDesc')))
+    children.push(React.createElement('div', { key: 'done-reverted', className: 'su-text' },
+      t2('dialog.doneReverted').replace('{n}', String((phase.reverted ?? []).length))))
+    if ((phase.conflicts ?? []).length > 0) {
+      children.push(React.createElement('div', { key: 'done-conflicts', className: 'su-error' },
+        t2('dialog.doneConflicts').replace('{n}', String(phase.conflicts.length))))
+    }
   } else {
     children.push(React.createElement('div', { key: 'warning', className: 'su-notice' }, t2('dialog.warning')))
     if (phase.kind === 'error') {

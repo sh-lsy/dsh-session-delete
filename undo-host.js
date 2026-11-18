@@ -144,26 +144,61 @@ export async function snapshotTree(ctx, config, executable, workspace, signal) {
   }
 }
 
-/** Restore the work tree to a snapshot tree; remove only non-ignored post-snapshot files. */
-export async function restoreTree(ctx, config, executable, workspace, treeId, signal) {
-  const scratch = await mkdtemp(join(workspace.objects, 'restore-'))
+/** Blob oid a tree holds at a path, or null when absent or not a blob. */
+async function treeBlobOid(ctx, config, executable, workspace, tree, path, signal) {
+  const result = await runGit(ctx, config, executable, ['ls-tree', tree, '--', path], { cwd: workspace.root, env: workspace.env, signal })
+  if (result.exitCode !== 0) return null
+  const match = /^\d+ blob ([0-9a-f]+)\t/.exec(result.stdout.split('\n')[0] ?? '')
+  return match ? match[1] : null
+}
+
+/** Current work-tree blob oid of a path, or null when the file is absent. */
+async function currentOid(ctx, config, executable, workspace, path, signal) {
+  const result = await runGit(ctx, config, executable, ['hash-object', '--', path], { cwd: workspace.root, env: workspace.env, signal })
+  if (result.exitCode !== 0) return null
+  return result.stdout.trim() || null
+}
+
+/**
+ * Conflict-aware revert of one turn's own file changes.
+ *
+ * Only files the turn changed (diff start→end) are considered, and each is
+ * reverted only when its current content still equals the turn's end state.
+ * A file modified after the turn is skipped and reported as a conflict; a file
+ * the turn never touched is never modified. The latest code is therefore
+ * preserved even when undoing an old turn.
+ * @returns reverted paths and skipped conflict paths.
+ */
+export async function revertTurn(ctx, config, executable, workspace, startTree, endTree, signal) {
+  const diff = await runGit(ctx, config, executable, ['diff', '--name-only', '-z', startTree, endTree], { cwd: workspace.root, env: workspace.env, signal })
+  if (diff.exitCode !== 0) throw new Error(`git diff failed: ${diff.stderr.trim()}`)
+  const paths = diff.stdout.split('\0').filter(Boolean)
+  const scratch = await mkdtemp(join(workspace.objects, 'revert-'))
+  const reverted = []
+  const conflicts = []
   try {
-    const index = join(scratch, 'index')
-    const env = { ...workspace.env, GIT_INDEX_FILE: index }
-    const read = await runGit(ctx, config, executable, ['read-tree', treeId], { cwd: workspace.root, env, signal })
-    if (read.exitCode !== 0) throw new Error(`git read-tree failed: ${read.stderr.trim()}`)
-    const checkout = await runGit(ctx, config, executable, ['checkout-index', '-a', '-f'], { cwd: workspace.root, env, signal })
-    if (checkout.exitCode !== 0) throw new Error(`git checkout-index failed: ${checkout.stderr.trim()}`)
-    const others = await runGit(ctx, config, executable, ['ls-files', '--others', '--exclude-standard', '-z'], { cwd: workspace.root, env, signal })
-    if (others.exitCode !== 0) throw new Error(`git ls-files failed: ${others.stderr.trim()}`)
-    const added = others.stdout.split('\0').filter(Boolean)
-    for (const rel of added) {
-      await rm(join(workspace.root, rel), { force: true })
+    const env = { ...workspace.env, GIT_INDEX_FILE: join(scratch, 'index') }
+    for (const path of paths) {
+      const endOid = await treeBlobOid(ctx, config, executable, workspace, endTree, path, signal)
+      const startOid = await treeBlobOid(ctx, config, executable, workspace, startTree, path, signal)
+      const curOid = await currentOid(ctx, config, executable, workspace, path, signal)
+      const unchangedSinceTurn = endOid !== null ? curOid === endOid : curOid === null
+      if (!unchangedSinceTurn) {
+        conflicts.push(path)
+        continue
+      }
+      if (startOid !== null) {
+        const checkout = await runGit(ctx, config, executable, ['checkout', startTree, '--', path], { cwd: workspace.root, env, signal })
+        if (checkout.exitCode !== 0) throw new Error(`git checkout ${path} failed: ${checkout.stderr.trim()}`)
+      } else {
+        await rm(join(workspace.root, path), { force: true })
+      }
+      reverted.push(path)
     }
-    return { removed: added.length }
   } finally {
     await rm(scratch, { recursive: true, force: true })
   }
+  return { reverted, conflicts }
 }
 
 /** Join the text blocks of a message content array. */
@@ -239,13 +274,27 @@ export function mountUndo(ctx, config) {
   }
 
   const pending = new Map()
-  const recordSnapshot = async (sessionId, turn, cwd) => {
+  const snapshotOf = async (cwd) => {
     const exe = await executable()
-    if (exe === null) return
+    if (exe === null) return null
     const workspace = await locateWorkspace(ctx, config, exe, cwd, new AbortController().signal)
-    if (workspace === null) return
-    const treeId = await snapshotTree(ctx, config, exe, workspace, new AbortController().signal)
-    snapshots.set(`${sessionId}#${turn}`, { sessionId, turn, treeId, cwd, time: Date.now() })
+    if (workspace === null) return null
+    return snapshotTree(ctx, config, exe, workspace, new AbortController().signal)
+  }
+  const recordStart = async (sessionId, turn, cwd) => {
+    const treeId = await snapshotOf(cwd)
+    if (treeId === null) return
+    const key = `${sessionId}#${turn}`
+    const existing = snapshots.get(key)
+    snapshots.set(key, { sessionId, turn, startTree: treeId, endTree: existing?.endTree ?? null, cwd, time: Date.now() })
+    await persist()
+  }
+  const recordEnd = async (sessionId, turn, cwd) => {
+    const treeId = await snapshotOf(cwd)
+    if (treeId === null) return
+    const key = `${sessionId}#${turn}`
+    const existing = snapshots.get(key)
+    snapshots.set(key, { sessionId, turn, startTree: existing?.startTree ?? treeId, endTree: treeId, cwd, time: Date.now() })
     await persist()
   }
 
@@ -253,12 +302,14 @@ export function mountUndo(ctx, config) {
   void load()
 
   ctx.on('session/event', (session, event) => {
-    if (event.type !== 'turn/start' || !config.snapshotEnabled) return
+    if (!config.snapshotEnabled) return
+    if (event.type !== 'turn/start' && event.type !== 'turn/end') return
     const { cwd, origin, delegationDepth } = session.header
     if (origin === 'subagent' || (delegationDepth ?? 0) > 0 || cwd === undefined) return
-    const promise = recordSnapshot(session.id, event.data.turn, cwd)
+    const record = event.type === 'turn/start' ? recordStart : recordEnd
+    const promise = record(session.id, event.data.turn, cwd)
       .catch(error => ctx.logger.warn(`session-undo: snapshot failed for ${session.id} turn ${event.data.turn}: ${String(error)}`))
-    pending.set(session.id, promise)
+    if (event.type === 'turn/start') pending.set(session.id, promise)
   })
   ctx.on('tools/pre-execute', async (exec, next) => {
     const sessionId = exec.agent?.session?.id
@@ -322,23 +373,17 @@ export async function prepare(ctx, config, executable, snapshots, body) {
     return { ok: false, code: rewind.code, message: `cannot undo: ${rewind.code}` }
   }
   const snapshot = snapshots.get(`${sessionId}#${rewind.turn}`)
-  if (snapshot === undefined) {
-    return { ok: false, code: 'no-snapshot', message: 'no file snapshot for this turn (non-git workspace, snapshot disabled, or snapshot expired)' }
+  if (snapshot === undefined || snapshot.startTree == null || snapshot.endTree == null) {
+    return { ok: false, code: 'no-snapshot', message: 'no complete file snapshot for this turn (snapshots disabled, expired, or the turn predates the plugin)' }
   }
   const exe = await executable()
   if (exe === null) return { ok: false, code: 'no-git', message: 'git is unavailable' }
   const signal = new AbortController().signal
   const workspace = await locateWorkspace(ctx, config, exe, snapshot.cwd, signal)
   if (workspace === null) return { ok: false, code: 'no-git', message: 'the workspace is no longer a git repository' }
-  try {
-    const safetyTree = await snapshotTree(ctx, config, exe, workspace, signal)
-    snapshots.set(`${sessionId}#safety-${Date.now()}`, { sessionId, turn: -1, treeId: safetyTree, cwd: snapshot.cwd, time: Date.now() })
-  } catch (error) {
-    ctx.logger.warn(`session-undo: safety snapshot failed: ${String(error)}`)
-  }
-  const result = await restoreTree(ctx, config, exe, workspace, snapshot.treeId, signal)
-  ctx.logger.info('session-undo: reverted %s to turn %d start (removed %d post-snapshot files)', sessionId, rewind.turn, result.removed)
-  return { ok: true, data: { boundary: rewind.boundary, prompt: rewind.prompt, turn: rewind.turn, removed: result.removed, cwd: snapshot.cwd } }
+  const result = await revertTurn(ctx, config, exe, workspace, snapshot.startTree, snapshot.endTree, signal)
+  ctx.logger.info('session-undo: reverted %s turn %d (%d files, %d conflicts skipped)', sessionId, rewind.turn, result.reverted.length, result.conflicts.length)
+  return { ok: true, data: { boundary: rewind.boundary, prompt: rewind.prompt, turn: rewind.turn, reverted: result.reverted, conflicts: result.conflicts, cwd: snapshot.cwd } }
 }
 
 /** List the recorded turn snapshots for one session, newest first. */
