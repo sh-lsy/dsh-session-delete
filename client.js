@@ -69,7 +69,7 @@ const DICT = {
   zh: {
     'menu.deleteSession': '删除会话',
     'dialog.title': '永久删除会话',
-    'dialog.warning': '⚠ 此操作不可恢复。会话记录与下列产物将从磁盘删除，没有回收站。',
+    'dialog.warning': '此操作不可恢复，会话记录与下列产物将从磁盘删除，没有回收站',
     'dialog.identity': '会话',
     'dialog.lastActive': '最后活动',
     'dialog.size': '占用大小',
@@ -114,7 +114,7 @@ const DICT = {
   en: {
     'menu.deleteSession': 'Delete session',
     'dialog.title': 'Permanently delete session',
-    'dialog.warning': '⚠ This cannot be undone. The session record and the artifacts below are removed from disk; there is no trash.',
+    'dialog.warning': 'This cannot be undone. The session record and the artifacts below are removed from disk; there is no trash',
     'dialog.identity': 'Session',
     'dialog.lastActive': 'Last activity',
     'dialog.size': 'On disk',
@@ -361,29 +361,47 @@ function formatTime(value) {
   }
 }
 
-const styles = {
-  warning: {
-    display: 'flex',
-    gap: '8px',
-    padding: '10px 12px',
-    margin: '0 0 12px',
-    borderRadius: '8px',
-    color: 'var(--dsw-alias-state-error-primary)',
-    background: 'var(--dsw-alias-interactive-bg-hover-danger)',
-    fontSize: '13px',
-    lineHeight: '20px',
-    fontWeight: 600,
-  },
-  meta: { display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '4px 12px', margin: '0 0 12px', fontSize: '12px', lineHeight: '20px' },
-  metaKey: { color: 'var(--dsw-alias-label-secondary)' },
-  list: { margin: '0 0 10px', padding: '0 0 0 18px', fontSize: '12px', lineHeight: '20px' },
-  keep: { margin: '0 0 12px', fontSize: '12px', lineHeight: '20px', color: 'var(--dsw-alias-label-secondary)' },
-  notice: { margin: '0 0 10px', fontSize: '12px', lineHeight: '20px', color: 'var(--dsw-alias-state-error-primary)' },
-  input: { width: '100%', boxSizing: 'border-box', padding: '8px 10px', borderRadius: '8px', border: '1px solid var(--dsw-alias-border-secondary)', background: 'var(--dsw-alias-bg-secondary)', color: 'var(--dsw-alias-label-primary)', fontSize: '13px' },
-  hint: { margin: '6px 0 0', fontSize: '12px', lineHeight: '18px', color: 'var(--dsw-alias-label-secondary)' },
-  row: { display: 'flex', gap: '8px', alignItems: 'center', justifyContent: 'flex-end' },
-  items: { margin: '0 0 10px', fontSize: '12px', lineHeight: '20px' },
+// Token-only stylesheet installed through the bundle's `meta.stylesheets`
+// contract. Classes are `sd-` prefixed; values reuse the design-system alias
+// tokens and the same 13px detail scale / spacing rhythm as the built-in
+// stop-and-archive dialog, so the card reads as part of the product.
+const SESSION_DELETE_CSS = `
+.sd-dialog { width: min(460px, 100%); }
+.sd-notice {
+  margin: 0 0 12px; padding: 10px 12px;
+  border-radius: var(--dsw-radius-sm);
+  background: var(--dsw-alias-interactive-bg-hover-danger);
+  color: var(--dsw-alias-state-error-primary);
+  font-size: 13px; line-height: 20px; font-weight: 400;
+  overflow-wrap: anywhere;
 }
+.sd-meta {
+  display: grid; grid-template-columns: auto 1fr; gap: 4px 12px;
+  margin: 0 0 16px; font-size: 13px; line-height: 20px;
+}
+.sd-meta-key { color: var(--dsw-alias-label-caption); font-size: 12px; line-height: 20px; }
+.sd-meta-val { color: var(--dsw-alias-label-primary); overflow-wrap: anywhere; min-width: 0; }
+.sd-section { margin: 0 0 6px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-caption); }
+.sd-list {
+  margin: 0 0 12px; padding-left: 18px;
+  font-size: 13px; line-height: 20px; color: var(--dsw-alias-label-primary);
+}
+.sd-list li { overflow-wrap: anywhere; }
+.sd-keep { margin: 0 0 12px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }
+.sd-hint { margin: 0 0 12px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); overflow-wrap: anywhere; }
+.sd-error { margin: 8px 0 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-state-error-primary); overflow-wrap: anywhere; }
+.sd-input {
+  box-sizing: border-box; width: 100%; height: 44px; padding: 7px 14px;
+  border: 0.5px solid var(--dsw-alias-border-l4); border-radius: var(--dsw-radius-lg);
+  outline: none; background: transparent;
+  font-size: 14px; font-weight: 400; line-height: 22px; color: var(--dsw-alias-label-primary);
+}
+.sd-input:focus { border-color: var(--dsw-alias-link); }
+.sd-fill { padding: 0; border: none; background: none; cursor: pointer; font-size: 13px; line-height: 20px; color: var(--dsw-alias-link); }
+.sd-confirm { margin: 4px 0 0; }
+.sd-delete:not(:disabled) { color: var(--dsw-alias-state-error-primary); }
+.sd-status { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }
+`
 
 /** The confirmation dialog; it owns the request lifecycle for one session at a time. */
 function DeleteDialog(props) {
@@ -460,73 +478,71 @@ function DeleteDialog(props) {
       return React.createElement(Button, { variant: 'primary', onClick: close }, t2('dialog.doneClose'))
     }
     if (phase.kind === 'needs-stop') {
-      return React.createElement('div', { style: styles.row },
-        React.createElement(Button, { variant: 'outline', onClick: close }, t2('dialog.cancel')),
-        React.createElement(Button, { variant: 'outline', onClick: () => { void run(true) } }, t2('dialog.stopAndDelete')),
-      )
+      return [
+        React.createElement(Button, { key: 'cancel', variant: 'outline', onClick: close }, t2('dialog.cancel')),
+        React.createElement(Button, { key: 'stop', variant: 'outline', className: 'sd-delete', onClick: () => { void run(true) } }, t2('dialog.stopAndDelete')),
+      ]
     }
-    return React.createElement('div', { style: styles.row },
-      React.createElement(Button, { variant: 'outline', disabled: phase.kind === 'working', onClick: close }, t2('dialog.cancel')),
+    return [
+      React.createElement(Button, { key: 'cancel', variant: 'outline', disabled: phase.kind === 'working', onClick: close }, t2('dialog.cancel')),
       React.createElement(Button, {
+        key: 'delete',
         variant: 'outline',
+        className: 'sd-delete',
         disabled: !canDelete || phase.kind === 'working',
         onClick: () => { void run(false) },
       }, phase.kind === 'working' ? t2('dialog.deleting') : t2('dialog.delete')),
-    )
+    ]
   })()
 
   const children = []
-  if (phase.kind === 'loading') children.push(React.createElement('div', { key: 'loading', style: styles.hint }, t2('dialog.loading')))
+  if (phase.kind === 'loading') children.push(React.createElement('div', { key: 'loading', className: 'sd-status', role: 'status' }, t2('dialog.loading')))
   if (phase.kind === 'ready' || phase.kind === 'working' || phase.kind === 'error') {
     if (data !== null) {
-      children.push(React.createElement('div', { key: 'warning', style: styles.warning }, t2('dialog.warning')))
-      children.push(React.createElement('div', { key: 'meta', style: styles.meta },
-        React.createElement('span', { style: styles.metaKey }, t2('dialog.identity')),
-        React.createElement('span', null, `${title}  (${request?.sessionId ?? ''})`),
-        React.createElement('span', { style: styles.metaKey }, t2('dialog.lastActive')),
-        React.createElement('span', null, formatTime(data.lastActivity)),
-        React.createElement('span', { style: styles.metaKey }, t2('dialog.size')),
-        React.createElement('span', null, formatSize(data.sizeBytes)),
-        React.createElement('span', { style: styles.metaKey }, t2('dialog.threshold')),
-        React.createElement('span', null, `${String(data.minAgeDays)} day(s)`),
+      if (data.eligible !== true) {
+        const reason = Array.isArray(data.reasons) && data.reasons.length > 0 ? data.reasons[0] : null
+        // The refusal leads the card so a blocked session never reads as a silent no-op.
+        children.push(React.createElement('div', { key: 'blocked', className: 'sd-notice', role: 'alert' },
+          `${t2('dialog.blocked')} · ${reason === null ? '' : t2(`reason.${reason.code}`)}`))
+      }
+      children.push(React.createElement('div', { key: 'warning', className: 'sd-notice' }, t2('dialog.warning')))
+      children.push(React.createElement('div', { key: 'meta', className: 'sd-meta' },
+        React.createElement('span', { className: 'sd-meta-key' }, t2('dialog.identity')),
+        React.createElement('span', { className: 'sd-meta-val' }, `${title} · ${request?.sessionId ?? ''}`),
+        React.createElement('span', { className: 'sd-meta-key' }, t2('dialog.lastActive')),
+        React.createElement('span', { className: 'sd-meta-val' }, formatTime(data.lastActivity)),
+        React.createElement('span', { className: 'sd-meta-key' }, t2('dialog.size')),
+        React.createElement('span', { className: 'sd-meta-val' }, formatSize(data.sizeBytes)),
+        React.createElement('span', { className: 'sd-meta-key' }, t2('dialog.threshold')),
+        React.createElement('span', { className: 'sd-meta-val' }, `${String(data.minAgeDays)} day(s)`),
       ))
-      children.push(React.createElement('div', { key: 'delete-head', style: styles.items }, t2('dialog.willDelete')))
-      children.push(React.createElement('ul', { key: 'delete-list', style: styles.list },
+      children.push(React.createElement('div', { key: 'delete-head', className: 'sd-section' }, t2('dialog.willDelete')))
+      children.push(React.createElement('ul', { key: 'delete-list', className: 'sd-list' },
         ['dialog.item.log', 'dialog.item.cache', 'dialog.item.spill', 'dialog.item.worktree', 'dialog.item.account', 'dialog.item.plan']
           .map(key => React.createElement('li', { key }, t2(key))),
       ))
-      children.push(React.createElement('div', { key: 'keep', style: styles.keep }, t2('dialog.willKeep')))
-      children.push(React.createElement('div', { key: 'worktree', style: styles.hint },
+      children.push(React.createElement('div', { key: 'keep', className: 'sd-keep' }, t2('dialog.willKeep')))
+      children.push(React.createElement('div', { key: 'worktree', className: 'sd-hint' },
         data.worktree === null || data.worktree === undefined
           ? t2('dialog.worktreeNo')
           : `${t2('dialog.worktreeYes')}${String(data.worktree.path)} → ${String(data.worktree.branch ?? '')}`,
       ))
       if (typeof data.childSessions === 'number' && data.childSessions > 0) {
-        children.push(React.createElement('div', { key: 'children', style: styles.notice },
+        children.push(React.createElement('div', { key: 'children', className: 'sd-error' },
           t2('dialog.children').replace('{n}', String(data.childSessions))))
       }
-      if (data.eligible !== true) {
-        const reason = Array.isArray(data.reasons) && data.reasons.length > 0 ? data.reasons[0] : null
-        // Unshifted so the refusal sits above the inventory: a blocked session
-        // must not read as a silent no-op.
-        children.unshift(React.createElement('div', { key: 'blocked', style: styles.warning },
-          `${t2('dialog.blocked')} — ${t2('dialog.reasonPrefix')}${reason === null ? '' : t2(`reason.${reason.code}`)}`))
-      }
       if (data.eligible === true && confirmRequired) {
-        children.push(React.createElement('div', { key: 'confirm' },
-          React.createElement('div', { style: styles.items }, t2('dialog.confirmLabel')),
+        children.push(React.createElement('div', { key: 'confirm', className: 'sd-confirm' },
+          React.createElement('div', { className: 'sd-section' }, t2('dialog.confirmLabel')),
           React.createElement('input', {
-            style: styles.input,
+            className: 'sd-input',
             value: typed,
+            'data-modal-autofocus': true,
             onChange: event => { setTyped(event.target.value) },
             'aria-label': t2('dialog.confirmLabel'),
           }),
-          React.createElement('div', { style: styles.hint },
-            React.createElement('button', {
-              type: 'button',
-              style: { background: 'none', border: 'none', padding: 0, color: 'var(--dsw-alias-brand-primary, #4d6bfe)', cursor: 'pointer', fontSize: '12px' },
-              onClick: () => { setTyped(title) },
-            }, t2('dialog.fill')),
+          React.createElement('div', { className: 'sd-hint' },
+            React.createElement('button', { type: 'button', className: 'sd-fill', onClick: () => { setTyped(title) } }, t2('dialog.fill')),
             ` · ${t2('dialog.confirmHint')}`,
           ),
         ))
@@ -534,30 +550,30 @@ function DeleteDialog(props) {
     }
   }
   if (phase.kind === 'needs-stop') {
-    children.push(React.createElement('div', { key: 'stop-head', style: styles.warning }, t2('dialog.needsStopTitle')))
-    children.push(React.createElement('div', { key: 'stop-desc', style: styles.items }, t2('dialog.needsStopDesc')))
-    children.push(React.createElement('ul', { key: 'stop-list', style: styles.list },
+    children.push(React.createElement('div', { key: 'stop-head', className: 'sd-notice' }, t2('dialog.needsStopTitle')))
+    children.push(React.createElement('div', { key: 'stop-desc', className: 'sd-section' }, t2('dialog.needsStopDesc')))
+    children.push(React.createElement('ul', { key: 'stop-list', className: 'sd-list' },
       (phase.activity ?? []).map((entry, index) => React.createElement('li', { key: `${entry?.kind ?? 'work'}-${String(index)}` },
         `${String(entry?.kind ?? 'activity')}${entry?.label === undefined ? '' : `: ${String(entry.label)}`}`)),
     ))
   }
   if (phase.kind === 'done') {
     const freed = formatSize(phase.data?.bytes)
-    children.push(React.createElement('div', { key: 'done-head', style: styles.items }, t2('dialog.success')))
-    children.push(React.createElement('div', { key: 'done-size', style: styles.hint }, t2('dialog.successSize').replace('{size}', freed)))
-    children.push(React.createElement('div', { key: 'done-worktree', style: styles.hint },
+    children.push(React.createElement('div', { key: 'done-head', className: 'sd-section' }, t2('dialog.success')))
+    children.push(React.createElement('div', { key: 'done-size', className: 'sd-hint' }, t2('dialog.successSize').replace('{size}', freed)))
+    children.push(React.createElement('div', { key: 'done-worktree', className: 'sd-hint' },
       t2('dialog.successWorktree').replace('{status}', String(phase.data?.worktree?.status ?? 'absent'))))
   }
   if (phase.kind === 'error') {
     const reasonKey = phase.code === undefined ? undefined : `reason.${String(phase.code)}`
     const localized = reasonKey === undefined ? reasonKey : t2(reasonKey)
-    children.push(React.createElement('div', { key: 'error', style: styles.notice, role: 'alert' },
+    children.push(React.createElement('div', { key: 'error', className: 'sd-error', role: 'alert' },
       localized === reasonKey || localized === undefined
         ? `${t2('reason.delete-failed')}${String(phase.message ?? phase.code ?? '')}`
         : localized))
   }
   if (phase.kind === 'ready' && confirmRequired && typed !== '' && !matches) {
-    children.push(React.createElement('div', { key: 'mismatch', style: styles.notice }, t2('dialog.mismatch')))
+    children.push(React.createElement('div', { key: 'mismatch', className: 'sd-error' }, t2('dialog.mismatch')))
   }
 
   return React.createElement(Modal, {
@@ -565,6 +581,7 @@ function DeleteDialog(props) {
     onClose: close,
     closeLabel: t2('dialog.cancel'),
     title: t2('dialog.title'),
+    className: 'sd-dialog',
     footer,
   }, ...children)
 }
@@ -671,4 +688,4 @@ function apply(ctx) {
 }
 
 module.exports = { name: 'session-delete', inject: ['contextMenus', 'slots', 'locale', 'sessions'], apply }
-return module.exports; } });
+return module.exports; }, meta: () => ({ stylesheets: { 'src/client/session-delete.css': { text: () => SESSION_DELETE_CSS } } }) });
