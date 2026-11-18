@@ -1,5 +1,7 @@
 # dsh-session-delete
 
+English | [中文](README.zh.md)
+
 A DeepSeek Harness **bundle plugin** for session cleanup and turn undo:
 
 - **Delete sessions** (single or batch) from the sidebar context menu, including

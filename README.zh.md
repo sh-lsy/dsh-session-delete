@@ -1,0 +1,116 @@
+# dsh-session-delete（会话清理与撤销）
+
+一个 DeepSeek Harness **bundle 插件**，提供两类功能：
+
+- **删除会话**：在侧栏右键菜单删除单个会话，或在工作区右键批量清理；连同会话产物一起清除，并可选做「参考计数式」附件回收。
+- **撤销一轮对话**：在每条助手消息的操作条上加一个 ↶ 图标，点击后把文件还原到该轮之前、分叉一个继续会话、并把提示词放回输入框（思路同 opencode `/undo` 与 Antigravity rewind）。
+
+插件装在 profile 里，位于 Harness 仓库**之外**：拉取官方更新不会影响它。
+
+```
+右键会话       → 删除会话
+右键工作区     → 批量清理会话
+助手消息操作条 → ↶ 回退此轮
+```
+
+「删除会话」位于内置「归档会话」正下方，红色危险样式。
+
+## 删除会清除什么
+
+删除是永久的，没有回收站。仅针对目标会话：
+
+| 产物 | 位置 |
+|---|---|
+| 会话日志（全部历史世代与压缩副本） | `$DSH_HOME/projects/<项目>/sessions/<id>/` |
+| 投影缓存文档 | 存储域 `session_projcache`，表 `sessions` |
+| 工具大输出 spill 文件 | `<tmp>/dsh-spill-*/session-<hash>/` |
+| 工作树 worktree | 走官方回收：仅在干净且无其他引用时删除，**分支保留** |
+| 工作区归属、置顶、归档记录 | `workspaceRegistry` |
+| 指向该会话的定时任务 | 删除前先停止 |
+
+## 删除会保留什么
+
+| 保留 | 原因 |
+|---|---|
+| 共享附件与上传文件（`attachments/v1/objects|files`） | 内容寻址、跨会话共享；官方暂无引用计数回收，按会话删会破坏其他会话 |
+| 工作区目录、代码、用户文件 | 与会话记录无关 |
+| 其他会话 | 只动目标目录 |
+
+## 删除的守卫
+
+- 本次运行打开过的会话**也能删**：先停止其工作、归档挡住新轮次、等在途轮次落盘后再删目录，避免「复活」。
+- 仍有运行中工作 → 先询问「停止并删除」。
+- 旧格式日志（需迁移）→ 拒绝，提示先打开一次完成迁移。
+- 仅支持官方默认 JSONL 持久化后端。
+- 单删**不设天数门槛**（手动点名删除是明确意图）；天数门槛用于批量清理。
+
+## 批量清理
+
+工作区右键「批量清理会话」打开选择器：
+
+- 复选框多选；**全选 / 清空 / 选择 N 天以上**。
+- 每行显示标题、占用、最后活动、运行中标记。
+- **深度清理附件**（默认关）：删除所选会话后，回收「这些会话引用、且剩余会话都不再引用」的附件对象；其他会话或工作区仍在用的一律保留。
+- 点「删除所选」→ **二次确认**（数量、附件选项、所选清单）→ 执行，报告删除数与释放空间。
+
+## 撤销一轮对话
+
+每条助手消息操作条上的 ↶ 图标，确认后：
+
+1. **还原文件**到该轮开始前的状态（每轮开始记录的持久 git 工作树快照）。
+2. **分叉继续会话**，继承该轮之前的所有轮次。DSH 会话日志是 append-only，所以回退是「分叉」而非原地截断；**原会话保留**。
+3. **回填提示词**：把被撤那轮的提示词放回新会话输入框。
+
+文件还原是保守的：`checkout-index -a -f` 还原快照里的每个文件（改动的还原、被删的重建），只删除「快照之后新增、且 git 不忽略」的文件。**忽略文件（node_modules、构建产物、被 .gitignore 匹配的 .env）绝不动**。还原前先打安全快照；运行中的轮次拒绝（`session-busy`）；需二次确认。
+
+限制：本版**仅 git 工作区**（非 git 轮次无快照，提示 `no-snapshot`）；快照从安装/重启后开始记录，按 `retentionDays` 清理；子代理会话不打快照。
+
+## 配置
+
+bundle 补丁挂载一行。在 profile 的 `cordis.patch.yml` 覆盖其 `config`：
+
+```yaml
+- id: session-delete
+  config:
+    requireTitleConfirmation: false  # true 时在弹窗之上再加「输入标题」确认
+    deleteSpillArtifacts: true
+    worktreeTimeoutMs: 20000         # 等待官方 worktree 回收的时长
+    stopSettleMs: 8000               # 删除前等待被停轮次收尾的时长
+    spillRoots: []                   # 额外 spill 根（除自动发现的 dsh-spill-*）
+    snapshotEnabled: true            # 为撤销记录每轮 git 快照
+    retentionDays: 7                 # N 天后清理撤销快照元数据
+    timeoutMs: 30000                 # 撤销快照的单条 git 命令超时
+    outputMaxBytes: 8388608          # 撤销快照的 git 输出上限
+    dataRoot: ''                     # 撤销数据根；空 = ~/.dsh/session-undo
+```
+
+## 安装
+
+```sh
+dsh plugin install <本目录的绝对路径>
+```
+
+或通过插件管理器（`install_bundle`，target 为本目录）。**安装/更新后重启一次 DeepSeek Harness**，让 Host 加载记录器与路由；之后刷新页面，撤销图标即出现在助手消息上。
+
+## 两半如何通信
+
+- Host：监听 `turn/start` 打快照（私有 git 对象库，仓库对象库作只读 alternate，不动仓库 index/refs）；owner-only 路由 `POST /session-delete/inspect|delete|batch-inspect|batch-delete` 与 `POST /session-undo/prepare|snapshots|purge`。
+- Web：注册会话/工作区右键菜单、`shell.overlay` 确认弹窗，以及 `conversation.chat.assistant-actions` 槽的撤销图标。撤销确认后调 `prepare`，再用官方客户端 `sessions.fork({ atSeq })` 分叉、打开子会话、经 conversation 输入面回填提示词。
+
+## 已知限制
+
+- 共享附件默认不删（官方无引用计数回收）；深度清理仅删无人引用者。
+- 撤销仅 git 工作区；快照自安装/重启起记录。
+- 回退是分叉（原会话保留），非原地截断——由 DSH 日志模型决定。
+- 撤销图标经插件槽位于复制**右侧**（复制与分叉之间）；严格「复制左侧」需改官方组件一行。
+
+## 开发
+
+```sh
+node tests/host.test.mjs   # 删除/批量（13 项）
+node tests/undo.test.mjs   # 撤销，含真实 git 仓库还原安全测试（6 项）
+```
+
+## 许可
+
+MIT
