@@ -1,0 +1,95 @@
+# dsh-session-delete
+
+A DeepSeek Harness **bundle plugin** that permanently deletes one stored Session and the artifacts it owns, from the sidebar context menu.
+
+It is installed into a profile, so it lives **outside** the Harness repository: pulling upstream Harness code never touches it.
+
+```
+right-click a session → 删除会话 (Delete session)
+```
+
+The entry sits directly below the built-in `归档会话` (Archive session) entry, in the danger colour.
+
+## What it deletes
+
+Deletion is permanent; there is no trash. For the target Session only:
+
+| Artifact | Location |
+|---|---|
+| Session log, every generation and compressed copy | `$DSH_HOME/projects/<project>/sessions/<id>/` |
+| Projection-cache document | storage domain `session_projcache`, table `sessions` |
+| Large tool-output spill files | `<tmp>/dsh-spill-*/session-<hash>/` |
+| Worktree | through the shipped reclamation: removed only when the checkout is clean and unreferenced; **the branch is kept** |
+| Workspace membership, pin, archive entry | `workspaceRegistry` |
+| Scheduled work targeting it | stopped first, so a later wake cannot recreate the Session |
+
+## What it keeps
+
+| Kept | Why |
+|---|---|
+| Shared attachments and uploaded files (`attachments/v1/objects|files`) | Content-addressed and shared across Sessions; Harness ships no reference-counting collector yet, so deleting them per Session would break other Sessions |
+| Workspace directories, code, user files | Unrelated to the Session record |
+| Every other Session | Only the target directory is touched |
+
+## Guards
+
+Every guard runs on the Host; the dialog only presents its answer.
+
+- **Live Sessions are refused.** A Session opened during the current run is attached to the in-memory store, and Harness has no public way to evict it; a later append would recreate the directory. Restart Harness and delete it then.
+- **Age threshold.** A Session whose last activity is newer than `minAgeDays` is refused. "Last activity" is the later of the header timestamp and the log's mtime, so a long-session resumed today still counts as recent.
+- **Migration-pending logs are refused.** Open the Session once so it migrates, then delete it.
+- **Only the JSONL backend is supported.** Any other `location.kind` is refused rather than guessed at.
+- **Irreversible confirmation.** The dialog shows a red warning, the complete inventory, and requires typing the Session title before the button enables.
+- **Worktree safety** is the shipped one: `git status` must be clean, the checkout must be unregistered-elsewhere, and `git worktree remove` runs without `--force`. A dirty worktree is retained and reported; the Session log is still deleted.
+
+## Configuration
+
+The bundle patch mounts one row. Override its `config` in your profile's `cordis.patch.yml`:
+
+```yaml
+- id: session-delete
+  config:
+    minAgeDays: 1                 # only Sessions inactive for at least N days; 0 disables the guard
+    requireTitleConfirmation: true
+    deleteSpillArtifacts: true
+    worktreeTimeoutMs: 20000      # how long to wait for the shipped worktree reclamation
+    spillRoots: []                # extra spill roots beside the discovered dsh-spill-* ones
+```
+
+## Install
+
+```sh
+dsh plugin install <absolute path to this directory>
+```
+
+or through the Plugin Manager (`install_bundle` with the bundle directory as target). The plugin ships plain JavaScript for both halves, so installation runs no build step.
+
+After installing, refresh the Web page once; the entry appears on the next right-click.
+
+## How the two halves talk
+
+The Node half registers two owner-only HTTP routes:
+
+- `POST /session-delete/inspect` — read-only inventory and refusal reasons.
+- `POST /session-delete/delete` — the deletion, or a `needs-stop` reply listing planned work.
+
+Both require `peer.principal.kind === 'owner'`. The Web half (`client.js`) is a hand-written Client bundle in the `__ModuleLoader__.load` format, so it needs no build toolchain and no imports beyond the shell baseline (`react`, `@deepseek-ai/dsh-client-ui-primitives`).
+
+## Known limitations
+
+- Deleting the Session you are currently viewing is refused by design (it is live).
+- A deleted Session's id stays in the Workspace registry's in-memory header index until the next start; the row is removed immediately and the stale index entry is unreachable from the UI.
+- Lineage: deleting a Session that other Sessions forked from leaves their `parentSession` pointing at nothing. The dialog warns with the child count; only the displayed lineage is affected.
+- Batch cleanup and automatic retention are not implemented. The same guards would apply.
+
+## Development
+
+```sh
+node tests/host.test.mjs      # Host-half behaviour; no build, no network
+```
+
+`node --test tests/` spawns a child process per file, which some sandboxes block; running the file directly keeps the run in-process.
+
+## License
+
+MIT

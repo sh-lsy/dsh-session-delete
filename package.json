@@ -1,0 +1,44 @@
+{
+  "name": "@sh-lsy/dsh-session-delete",
+  "version": "0.1.0",
+  "description": "Permanently delete a DeepSeek Harness Session and the artifacts it owns, from the sidebar context menu",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "engines": {
+    "dsh": ">=0.2.2-rc.3"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "session",
+    "cleanup"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": [
+        "./cordis.patch.yml"
+      ]
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-context-menu",
+        "@deepseek-ai/dsh-client-ui-primitives",
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ]
+    }
+  }
+}

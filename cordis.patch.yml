@@ -1,0 +1,19 @@
+# Bundle patch for @sh-lsy/dsh-session-delete.
+#
+# One row mounts both halves: the Node entry registers the owner-only
+# `POST /session-delete/inspect` and `POST /session-delete/delete` routes, and
+# the `dsh.client` declaration in package.json makes the Web shell load
+# `client.js` as a Client plugin.
+#
+# Patch a row by id with a complete `config` object to change the defaults:
+#   - id: session-delete
+#     config: { minAgeDays: 3 }
+- insert:
+    - id: session-delete
+      name: '@sh-lsy/dsh-session-delete'
+      config:
+        minAgeDays: 1
+        requireTitleConfirmation: true
+        deleteSpillArtifacts: true
+        worktreeTimeoutMs: 20000
+        spillRoots: []
