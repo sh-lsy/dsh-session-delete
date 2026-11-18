@@ -25,12 +25,13 @@ import { createHash } from 'node:crypto'
 import { readdir, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { mountUndo, resolveUndoConfig, undoDefaults } from './undo-host.js'
 
 /** Cordis plugin name. */
 export const name = 'session-delete'
 
 /** Required services; optional ones are read with `ctx.get()`. */
-export const inject = ['webServer', 'sessionPersistence', 'workspaceRegistry']
+export const inject = ['webServer', 'sessionPersistence', 'workspaceRegistry', 'subprocess', 'sessionQuery']
 
 const INSPECT_PATH = '/session-delete/inspect'
 const DELETE_PATH = '/session-delete/delete'
@@ -50,6 +51,7 @@ export function defaultConfig() {
     worktreeTimeoutMs: 20_000,
     stopSettleMs: 8_000,
     spillRoots: [],
+    ...undoDefaults(),
   }
 }
 
@@ -84,6 +86,7 @@ export function resolveConfig(raw) {
     worktreeTimeoutMs: duration('worktreeTimeoutMs'),
     stopSettleMs: duration('stopSettleMs'),
     spillRoots: [...spillRoots],
+    ...resolveUndoConfig(raw),
   }
 }
 
@@ -104,6 +107,7 @@ export function apply(ctx, rawConfig) {
   route(DELETE_PATH, body => deleteSession(ctx, config, body))
   route(BATCH_INSPECT_PATH, body => batchInspect(ctx, config, body.workspaceId), true)
   route(BATCH_DELETE_PATH, body => batchDelete(ctx, config, body), true)
+  mountUndo(ctx, config)
 }
 
 /**

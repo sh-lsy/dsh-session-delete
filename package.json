@@ -1,7 +1,7 @@
 {
   "name": "@sh-lsy/dsh-session-delete",
-  "version": "0.1.0",
-  "description": "Permanently delete a DeepSeek Harness Session and the artifacts it owns, from the sidebar context menu",
+  "version": "0.2.0",
+  "description": "Session cleanup and turn undo for DeepSeek Harness: delete sessions (single/batch) with artifact and attachment GC, and undo a turn (revert files, fork, restore prompt)",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -11,6 +11,7 @@
   },
   "files": [
     "index.js",
+    "undo-host.js",
     "client.js",
     "cordis.patch.yml",
     "README.md",
@@ -24,7 +25,8 @@
     "dsh",
     "dsh-plugin",
     "session",
-    "cleanup"
+    "cleanup",
+    "undo"
   ],
   "dsh": {
     "bundle": {
@@ -37,7 +39,10 @@
       "inject": [
         "@deepseek-ai/dsh-client-ui-context-menu",
         "@deepseek-ai/dsh-client-ui-primitives",
-        "@deepseek-ai/dsh-client-ui-workspace"
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-chat",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-api-session-controller"
       ]
     }
   }

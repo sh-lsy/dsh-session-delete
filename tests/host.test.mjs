@@ -88,23 +88,32 @@ test('resolveConfig validates every field and keeps the documented defaults', ()
     worktreeTimeoutMs: 20000,
     stopSettleMs: 8000,
     spillRoots: [],
+    snapshotEnabled: true,
+    retentionDays: 7,
+    timeoutMs: 30000,
+    outputMaxBytes: 8388608,
+    dataRoot: '',
   })
   assert.equal(resolveConfig({ requireTitleConfirmation: true }).requireTitleConfirmation, true)
   assert.equal(resolveConfig({ stopSettleMs: 0 }).stopSettleMs, 0)
+  assert.equal(resolveConfig({ retentionDays: 14 }).retentionDays, 14)
   assert.throws(() => resolveConfig({ stopSettleMs: -1 }), /non-negative/u)
   assert.throws(() => resolveConfig({ worktreeTimeoutMs: '1' }), /non-negative/u)
   assert.throws(() => resolveConfig({ requireTitleConfirmation: 'yes' }), /boolean/u)
   assert.throws(() => resolveConfig({ spillRoots: [''] }), /non-empty strings/u)
 })
 
-test('apply registers four owner-only POST routes', () => {
+test('apply registers the delete and undo owner-only POST routes', () => {
   const ctx = makeContext()
-  apply(ctx, undefined)
+  apply(ctx, { dataRoot: join(tmpdir(), 'dsh-sd-apply-test') })
   assert.deepEqual([...ctx.routes.keys()].sort(), [
     '/session-delete/batch-delete',
     '/session-delete/batch-inspect',
     '/session-delete/delete',
     '/session-delete/inspect',
+    '/session-undo/prepare',
+    '/session-undo/purge',
+    '/session-undo/snapshots',
   ])
   for (const route of ctx.routes.values()) {
     assert.equal(route.kind, 'exact')

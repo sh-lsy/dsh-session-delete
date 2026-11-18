@@ -268,6 +268,30 @@ const SESSION_DELETE_CSS = `
 .sd-row-meta { flex: none; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-caption); white-space: nowrap; font-variant-numeric: tabular-nums; }
 .sd-badge { flex: none; font-size: 11px; line-height: 16px; color: var(--dsw-alias-state-warn-primary); }
 .sd-deep { display: flex; align-items: flex-start; gap: 8px; margin: 0 0 4px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }
+.su-action {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: calc(28px + var(--dsh-content-font-delta, 0px));
+  height: calc(28px + var(--dsh-content-font-delta, 0px));
+  padding: 6px; border: none; border-radius: var(--dsw-radius-sm);
+  background: transparent; color: var(--dsw-alias-label-tertiary); cursor: pointer;
+}
+.su-action svg { width: calc(16px + var(--dsh-content-font-delta, 0px)); height: calc(16px + var(--dsh-content-font-delta, 0px)); }
+@media (hover: hover) {
+  .su-action:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-secondary); }
+}
+.su-dialog.su-dialog { width: min(440px, 100%); max-height: 100%; overflow: hidden; }
+@supports (height: 100dvh) { .su-dialog.su-dialog { max-height: calc(100dvh - 48px); } }
+.su-content { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.su-notice {
+  margin: 0 0 14px; padding: 10px 12px; border-radius: var(--dsw-radius-sm);
+  background: var(--dsw-alias-interactive-bg-hover-danger); color: var(--dsw-alias-state-error-primary);
+  font-size: 13px; line-height: 20px; font-weight: 400; overflow-wrap: anywhere;
+}
+.su-text { margin: 0; font-size: 13px; line-height: 20px; color: var(--dsw-alias-label-secondary); }
+.su-error { margin: 10px 0 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-state-error-primary); overflow-wrap: anywhere; }
+.su-btn-cancel { min-width: 72px; }
+.su-btn-confirm { min-width: 136px; }
+.su-delete:not(:disabled) { color: var(--dsw-alias-state-error-primary); }
 `
 
 /** Install the stylesheet once, directly into the document head. */
@@ -309,7 +333,10 @@ function FallbackButton(props) {
   }, children)
 }
 
-const { Modal = FallbackModal, Button = FallbackButton } = primitiveModule
+const { Modal = FallbackModal, Button = FallbackButton, Tooltip = FallbackTooltip } = primitiveModule
+
+/** Minimal tooltip fallback when primitives are unavailable. */
+function FallbackTooltip(props) { return props.children }
 
 /** Minimal observable snapshot source for the registrant-private dialog request. */
 function createSource(initial) {
@@ -705,6 +732,159 @@ function BatchDialog(props) {
 }
 
 /** Plugin `apply`: stylesheet, dictionaries, the context-menu entry, and the overlay dialog. */
+// --- Turn undo (message action strip icon + confirmation + fork + prompt restore) ---
+
+const UNDO_NS = 'sessionUndo'
+const UNDO_DICT = {
+  zh: {
+    'action.undo': '回退此轮',
+    'dialog.title': '回退此轮对话',
+    'dialog.warning': '将把文件还原到这一轮之前，并分叉一个继续会话；这一轮及之后的文件改动会被还原，原会话保留',
+    'dialog.cancel': '取消',
+    'dialog.confirm': '回退',
+    'dialog.working': '正在回退…',
+    'dialog.done': '完成',
+    'dialog.doneTitle': '已回退',
+    'dialog.doneDesc': '已打开继续会话，提示词已放回输入框',
+    'dialog.failed': '回退失败：',
+    'reason.session-busy': '该会话正在运行轮次，请先停止再回退',
+    'reason.no-snapshot': '这一轮没有文件快照（非 git 工作区、快照未启用或已过期）',
+    'reason.no-git': 'git 不可用或工作区不是 git 仓库',
+    'reason.no-prior-turn': '这是第一轮，没有可回退的前序状态',
+    'reason.message-not-found': '找不到该消息对应的轮次',
+    'reason.fork-failed': '分叉继续会话失败：',
+  },
+  en: {
+    'action.undo': 'Undo this turn',
+    'dialog.title': 'Undo this turn',
+    'dialog.warning': 'Reverts files to before this turn and forks a continuation session; file changes from this turn onward are reverted, the original session is kept',
+    'dialog.cancel': 'Cancel',
+    'dialog.confirm': 'Undo',
+    'dialog.working': 'Undoing…',
+    'dialog.done': 'Done',
+    'dialog.doneTitle': 'Undone',
+    'dialog.doneDesc': 'Opened the continuation session with the prompt restored to the composer',
+    'dialog.failed': 'Undo failed: ',
+    'reason.session-busy': 'The session is running a turn; stop it before undoing',
+    'reason.no-snapshot': 'No file snapshot for this turn (non-git workspace, snapshots disabled, or expired)',
+    'reason.no-git': 'git is unavailable or the workspace is not a git repository',
+    'reason.no-prior-turn': 'This is the first turn; there is no prior state to revert to',
+    'reason.message-not-found': 'No turn found for this message',
+    'reason.fork-failed': 'Forking the continuation session failed: ',
+  },
+}
+
+/** A left-curving undo arrow drawn in currentColor. */
+function UndoIcon() {
+  return React.createElement('svg', {
+    viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5,
+    strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true,
+  },
+  React.createElement('path', { d: 'M6 3.5 2.5 7 6 10.5' }),
+  React.createElement('path', { d: 'M2.5 7h6.5a4 4 0 0 1 0 8H7' }))
+}
+
+/** The undo icon contribution rendered in the assistant action strip. */
+function UndoAction(props) {
+  const label = typeof props.t === 'function' ? props.t('action.undo') : 'Undo this turn'
+  return React.createElement(Tooltip, { label, side: 'bottom' },
+    React.createElement('button', {
+      type: 'button', className: 'su-action', 'aria-label': label,
+      onClick: () => { props.undo(props.messageId) },
+    }, React.createElement(UndoIcon)))
+}
+
+/** Restore the prompt to a session's composer once its scope is retained. */
+function prefillDraft(ctx, sessionId, prompt) {
+  if (prompt === '') return
+  let tries = 0
+  const attempt = () => {
+    const actx = ctx.sessions.scope?.(sessionId)
+    if (actx !== undefined) {
+      try {
+        ctx.uiConversation.input.for(actx).setDraft(prompt)
+        return
+      } catch { /* fall through to retry */ }
+    }
+    if (tries++ < 25) setTimeout(attempt, 100)
+  }
+  attempt()
+}
+
+/** Run the full undo: prepare (revert files) → fork → open → restore prompt. */
+async function runUndo(ctx, request) {
+  const prepared = await post('/session-undo/prepare', { sessionId: request.sessionId, messageId: request.messageId })
+  if (prepared?.ok !== true) return { ok: false, code: prepared?.code, message: prepared?.message }
+  const { boundary, prompt, turn } = prepared.data
+  let childId
+  try {
+    childId = await ctx.sessions.fork({
+      sessionId: request.sessionId,
+      atSeq: boundary,
+      onCreated: (id) => {
+        try {
+          const binding = ctx.sessions.binding(id)
+          if (binding !== undefined) {
+            ctx.uiConversation.input.requestDraftInitialization(binding, { prompt, clearPreviousDraft: true })
+          }
+        } catch { /* the post-open prefill is the fallback */ }
+      },
+    })
+  } catch (error) {
+    return { ok: false, code: 'fork-failed', message: error instanceof Error ? error.message : String(error) }
+  }
+  ctx.uiWorkspace.openSession(childId)
+  prefillDraft(ctx, childId, prompt)
+  return { ok: true, turn, childId }
+}
+
+/** The undo confirmation dialog hosted in shell.overlay. */
+function UndoDialog(props) {
+  const request = typeof props.useUndoRequest === 'function' ? props.useUndoRequest(state => state) : null
+  const [phase, setPhase] = React.useState({ kind: 'idle' })
+  React.useEffect(() => {
+    if (request === null) setPhase({ kind: 'idle' })
+  }, [request])
+  const t2 = (key) => (typeof props.translate === 'function' ? props.translate(key) : key)
+  const close = () => {
+    if (phase.kind === 'working') return
+    props.dismiss()
+  }
+  const confirm = async () => {
+    if (request === null || phase.kind === 'working') return
+    setPhase({ kind: 'working' })
+    const result = await props.confirmUndo(request)
+    setPhase(result?.ok === true ? { kind: 'done', turn: result.turn } : { kind: 'error', code: result?.code, message: result?.message })
+  }
+  const footer = (() => {
+    if (phase.kind === 'done') return React.createElement(Button, { variant: 'primary', className: 'su-btn-confirm', onClick: close }, t2('dialog.done'))
+    return [
+      React.createElement(Button, { key: 'cancel', variant: 'outline', className: 'su-btn-cancel', disabled: phase.kind === 'working', onClick: close }, t2('dialog.cancel')),
+      React.createElement(Button, { key: 'confirm', variant: 'outline', className: 'su-delete su-btn-confirm', disabled: phase.kind === 'working', onClick: () => { void confirm() } },
+        phase.kind === 'working' ? t2('dialog.working') : t2('dialog.confirm')),
+    ]
+  })()
+  const children = []
+  if (phase.kind === 'done') {
+    children.push(React.createElement('div', { key: 'done-title', className: 'su-text', style: { fontWeight: 500, color: 'var(--dsw-alias-label-primary)' } }, t2('dialog.doneTitle')))
+    children.push(React.createElement('div', { key: 'done-desc', className: 'su-text' }, t2('dialog.doneDesc')))
+  } else {
+    children.push(React.createElement('div', { key: 'warning', className: 'su-notice' }, t2('dialog.warning')))
+    if (phase.kind === 'error') {
+      const reasonKey = phase.code === undefined ? undefined : `reason.${String(phase.code)}`
+      const localized = reasonKey === undefined ? undefined : t2(reasonKey)
+      children.push(React.createElement('div', { key: 'error', className: 'su-error', role: 'alert' },
+        localized === reasonKey || localized === undefined
+          ? `${t2('dialog.failed')}${String(phase.message ?? phase.code ?? '')}`
+          : localized))
+    }
+  }
+  return React.createElement(Modal, {
+    open: request !== null, onClose: close, closeLabel: t2('dialog.cancel'),
+    title: t2('dialog.title'), className: 'su-dialog', contentClassName: 'su-content', footer,
+  }, ...children)
+}
+
 function apply(ctx) {
   try {
     injectStyles()
@@ -792,11 +972,41 @@ function apply(ctx) {
         titleOf: (id) => ctx.sessions.list.getSnapshot().byId[id]?.displayTitle ?? id,
       }),
     }, BatchDialog))
+
+    // Turn undo: a second locale namespace, the message-strip icon, and a dialog.
+    const tu = ctx.locale.bind(UNDO_NS)
+    for (const [locale, dict] of Object.entries(UNDO_DICT)) {
+      try { ctx.locale.register(UNDO_NS, locale, { ...UNDO_DICT.en, ...dict }) }
+      catch (error) { console.warn('session-undo: locale already registered', error) }
+    }
+    const undoRequest = createSource(null)
+
+    ctx.slots.inject('conversation.chat.assistant-actions', () => ctx.slots.register({
+      name: 'conversation.chat.assistant-actions',
+      id: 'session-undo',
+      order: 5,
+      locale: UNDO_NS,
+      inject: (sessionId) => ({
+        undo: (messageId) => { undoRequest.set({ sessionId, messageId }) },
+      }),
+    }, UndoAction))
+
+    ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+      name: 'shell.overlay',
+      id: 'session-undo.dialog',
+      locale: UNDO_NS,
+      inject: () => ({
+        hooks: { undoRequest },
+        dismiss: () => { undoRequest.set(null) },
+        translate: tu,
+        confirmUndo: (request) => runUndo(ctx, request),
+      }),
+    }, UndoDialog))
   } catch (error) {
     console.error('session-delete: client apply failed', error)
     showBanner(`session-delete 客户端加载失败：${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
-module.exports = { name: 'session-delete', inject: ['contextMenus', 'slots', 'locale', 'sessions'], apply }
+module.exports = { name: 'session-delete', inject: ['contextMenus', 'slots', 'locale', 'sessions', 'uiWorkspace', 'uiConversation'], apply }
 return module.exports; } });

@@ -1,14 +1,22 @@
 # dsh-session-delete
 
-A DeepSeek Harness **bundle plugin** that permanently deletes one stored Session and the artifacts it owns, from the sidebar context menu.
+A DeepSeek Harness **bundle plugin** for session cleanup and turn undo:
+
+- **Delete sessions** (single or batch) from the sidebar context menu, including
+  artifact cleanup and an optional reference-counted attachment GC.
+- **Undo a turn** from an icon on each assistant message: revert the files the
+  turn changed, fork a continuation session, and restore the prompt to the
+  composer (in the spirit of opencode `/undo` and Antigravity rewind).
 
 It is installed into a profile, so it lives **outside** the Harness repository: pulling upstream Harness code never touches it.
 
 ```
 right-click a session → 删除会话 (Delete session)
+right-click a workspace → 批量清理会话 (Clean up sessions)
+assistant message action strip → ↶ 回退此轮 (Undo this turn)
 ```
 
-The entry sits directly below the built-in `归档会话` (Archive session) entry, in the danger colour.
+The delete entry sits directly below the built-in `归档会话` (Archive session) entry, in the danger colour.
 
 ## What it deletes
 
@@ -61,6 +69,11 @@ The bundle patch mounts one row. Override its `config` in your profile's `cordis
     worktreeTimeoutMs: 20000         # how long to wait for the shipped worktree reclamation
     stopSettleMs: 8000               # how long to wait for a stopped turn to finish before deleting
     spillRoots: []                   # extra spill roots beside the discovered dsh-spill-* ones
+    snapshotEnabled: true            # record per-turn git snapshots for undo
+    retentionDays: 7                 # purge undo snapshot metadata after N days
+    timeoutMs: 30000                 # per-git-command timeout for undo snapshots
+    outputMaxBytes: 8388608          # git output cap for undo snapshots
+    dataRoot: ''                     # undo data root; empty = ~/.dsh/session-undo
 ```
 
 ## Batch cleanup
@@ -72,6 +85,29 @@ The workspace right-click menu gains **Clean up sessions** (above "delete worksp
 - **Deep attachment cleanup** (off by default): after deleting the selected sessions, removes attachment objects that those sessions referenced **and no remaining session references**. Anything still used by another session or at workspace level is kept. This is reference-counted, so shared attachments are never deleted out from under a live session.
 
 Confirming deletes the selected sessions through the same safe path as a single deletion (stop running work, archive, await the turn, remove the directory), then runs the attachment GC and reports deleted counts and freed bytes.
+
+## Turn undo
+
+An undo icon (↶) appears in each assistant message's action strip, beside copy.
+Confirming it:
+
+1. **Reverts files** to the state at the start of that turn, from a persistent
+   git working-tree snapshot recorded at every turn start.
+2. **Forks a continuation session** inheriting every earlier turn. DSH's session
+   log is append-only, so rewind is a fork rather than an in-place truncation;
+   the original session is kept.
+3. **Restores the prompt** of the undone turn to the new session's composer.
+
+File revert is conservative: `checkout-index -a -f` restores every file the
+snapshot holds (modified files reverted, deleted files recreated), and only
+non-ignored files added after the snapshot are removed. Ignored files
+(`node_modules`, build output, `.env` matched by `.gitignore`) are never touched.
+A safety snapshot is taken before reverting, a running turn is refused
+(`session-busy`), and undo asks for confirmation first.
+
+Limits: **git workspaces only** in this version (a non-git turn has no snapshot,
+`no-snapshot`); snapshots are recorded from install onward and purged after
+`retentionDays`; subagent sessions are not snapshotted.
 
 ## Install
 
