@@ -523,7 +523,15 @@ function apply(ctx) {
   const t = ctx.locale.bind(NS)
   // Every language carries the English keys it does not translate, so `t`
   // never falls back to a raw key for a locale with a partial dictionary.
-  for (const [locale, dict] of Object.entries(DICT)) ctx.locale.register(NS, locale, { ...DICT.en, ...dict })
+  for (const [locale, dict] of Object.entries(DICT)) {
+    try {
+      ctx.locale.register(NS, locale, { ...DICT.en, ...dict })
+    } catch (error) {
+      // A development reload re-applies this plugin; a duplicate registration
+      // must not take the sidebar down with it.
+      console.warn('session-delete: locale dictionary already registered', error)
+    }
+  }
   const request = createSource(null)
 
   ctx.effect(() => ctx.contextMenus.register({
