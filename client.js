@@ -659,13 +659,11 @@ function BatchDialog(props) {
     children.push(React.createElement('div', { key: 'confirm-deep', className: 'sd-meta' },
       deep ? t2('batch.confirmDeep') : t2('batch.confirmNoDeep')))
     const chosen = sessions.filter(session => selected.has(session.sessionId))
-    children.push(React.createElement('div', { key: 'confirm-list', className: 'sd-list-box', role: 'group', 'aria-label': t2('batch.confirmDelete') },
-      chosen.map(session => React.createElement('div', { key: session.sessionId, className: 'sd-row' },
-        React.createElement('span', { className: 'sd-row-main' },
-          React.createElement('span', { className: 'sd-row-title' }, titleOf(session.sessionId)),
-          React.createElement('span', { className: 'sd-row-meta' }, formatSize(session.sizeBytes)))),
-      ))
-    ))
+    const chosenRows = chosen.map(session => React.createElement('div', { key: session.sessionId, className: 'sd-row' },
+      React.createElement('span', { className: 'sd-row-main' },
+        React.createElement('span', { className: 'sd-row-title' }, titleOf(session.sessionId)),
+        React.createElement('span', { className: 'sd-row-meta' }, formatSize(session.sizeBytes)))))
+    children.push(React.createElement('div', { key: 'confirm-list', className: 'sd-list-box', role: 'group', 'aria-label': t2('batch.confirmDelete') }, chosenRows))
   }
   if (phase.kind === 'done') {
     const data = phase.data ?? {}
