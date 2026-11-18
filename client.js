@@ -230,7 +230,12 @@ const DICT = {
 // the product's 13px detail scale; the dialog stays as minimal as the built-in
 // stop-and-archive confirmation.
 const SESSION_DELETE_CSS = `
-.sd-dialog { width: min(420px, 100%); }
+.sd-dialog { width: min(440px, 100%); max-height: 100%; overflow: hidden; }
+.sd-batch-dialog { width: min(480px, 100%); max-height: 100%; overflow: hidden; }
+@supports (height: 100dvh) {
+  .sd-dialog, .sd-batch-dialog { max-height: calc(100dvh - 48px); }
+}
+.sd-content { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
 .sd-notice {
   margin: 0 0 14px; padding: 10px 12px;
   border-radius: var(--dsw-radius-sm);
@@ -249,11 +254,12 @@ const SESSION_DELETE_CSS = `
 .sd-list li { overflow-wrap: anywhere; }
 .sd-status { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }
 .sd-delete:not(:disabled) { color: var(--dsw-alias-state-error-primary); }
-.sd-batch-dialog { width: min(520px, 100%); }
+.sd-btn-cancel { min-width: 72px; }
+.sd-btn-confirm { min-width: 136px; }
 .sd-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0 0 10px; }
 .sd-link { padding: 0; border: none; background: none; cursor: pointer; font-size: 12px; line-height: 18px; color: var(--dsw-alias-link); }
 .sd-days { width: 56px; height: 26px; padding: 2px 8px; border: 0.5px solid var(--dsw-alias-border-l4); border-radius: var(--dsw-radius-sm); background: transparent; color: var(--dsw-alias-label-primary); font-size: 12px; }
-.sd-list-box { max-height: 300px; overflow: auto; margin: 0 0 12px; border: 0.5px solid var(--dsw-alias-border-l4); border-radius: var(--dsw-radius-sm); }
+.sd-list-box { margin: 0 0 12px; border: 0.5px solid var(--dsw-alias-border-l4); border-radius: var(--dsw-radius-sm); }
 .sd-row { display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px; cursor: pointer; }
 .sd-row:hover { background: var(--dsw-alias-interactive-bg-hover); }
 .sd-row + .sd-row { border-top: 0.5px solid var(--dsw-alias-border-l4); }
@@ -448,9 +454,9 @@ function DeleteDialog(props) {
       ]
     }
     return [
-      React.createElement(Button, { key: 'cancel', variant: 'outline', disabled: phase.kind === 'working', onClick: close }, t2('dialog.cancel')),
+      React.createElement(Button, { key: 'cancel', variant: 'outline', className: 'sd-btn-cancel', disabled: phase.kind === 'working', onClick: close }, t2('dialog.cancel')),
       React.createElement(Button, {
-        key: 'delete', variant: 'outline', className: 'sd-delete',
+        key: 'delete', variant: 'outline', className: 'sd-delete sd-btn-confirm',
         disabled: !canDelete || phase.kind === 'working',
         onClick: () => { void run(false) },
       }, phase.kind === 'working' ? t2('dialog.deleting') : t2('dialog.delete')),
@@ -514,6 +520,7 @@ function DeleteDialog(props) {
     closeLabel: t2('dialog.cancel'),
     title: t2('dialog.title'),
     className: 'sd-dialog',
+    contentClassName: 'sd-content',
     footer,
   }, ...children)
 }
@@ -591,18 +598,18 @@ function BatchDialog(props) {
 
   const footer = (() => {
     if (phase.kind === 'done') {
-      return React.createElement(Button, { variant: 'primary', onClick: close }, t2('batch.done'))
+      return React.createElement(Button, { variant: 'primary', className: 'sd-btn-confirm', onClick: close }, t2('batch.done'))
     }
     if (phase.kind === 'confirm') {
       return [
-        React.createElement(Button, { key: 'back', variant: 'outline', onClick: back }, t2('batch.back')),
-        React.createElement(Button, { key: 'confirm', variant: 'outline', className: 'sd-delete', onClick: () => { void run() } }, t2('batch.confirmDelete')),
+        React.createElement(Button, { key: 'back', variant: 'outline', className: 'sd-btn-cancel', onClick: back }, t2('batch.back')),
+        React.createElement(Button, { key: 'confirm', variant: 'outline', className: 'sd-delete sd-btn-confirm', onClick: () => { void run() } }, t2('batch.confirmDelete')),
       ]
     }
     return [
-      React.createElement(Button, { key: 'cancel', variant: 'outline', disabled: phase.kind === 'working', onClick: close }, t2('batch.cancel')),
+      React.createElement(Button, { key: 'cancel', variant: 'outline', className: 'sd-btn-cancel', disabled: phase.kind === 'working', onClick: close }, t2('batch.cancel')),
       React.createElement(Button, {
-        key: 'delete', variant: 'outline', className: 'sd-delete',
+        key: 'delete', variant: 'outline', className: 'sd-delete sd-btn-confirm',
         disabled: selected.size === 0 || phase.kind !== 'ready',
         onClick: requestConfirm,
       }, phase.kind === 'working' ? t2('batch.deleting') : t2('batch.deleteSelected').replace('{n}', String(selected.size))),
@@ -696,6 +703,7 @@ function BatchDialog(props) {
     closeLabel: t2('batch.cancel'),
     title: t2('batch.title'),
     className: 'sd-batch-dialog',
+    contentClassName: 'sd-content',
     footer,
   }, ...children)
 }
