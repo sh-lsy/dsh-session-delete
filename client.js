@@ -11,14 +11,59 @@ var module = { exports: {} }; var exports = module.exports;
  * collects the typed confirmation, and refreshes the sidebar list afterwards.
  */
 const React = require('react')
-const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
+
+// The design-system primitives are a shell baseline module. A plugin bundle is
+// loaded through the module table, whose interop shape is not something this
+// package can assume, so a missing export degrades to a self-contained overlay
+// instead of an undefined component that renders nothing.
+let primitiveModule = {}
+try {
+  primitiveModule = require('@deepseek-ai/dsh-client-ui-primitives') ?? {}
+} catch (error) {
+  console.warn('session-delete: design-system primitives unavailable, using the built-in overlay', error)
+}
 
 const NS = 'sessionDelete'
 const INSPECT_PATH = '/session-delete/inspect'
 const DELETE_PATH = '/session-delete/delete'
 const MENU_ORDER = 700 // the built-in archive contribution sits at 600
 
-const { Modal, Button } = primitives
+/** Minimal modal used when the design-system primitives are unavailable. */
+function FallbackModal(props) {
+  if (props.open !== true) return null
+  const { children, footer, title, onClose, closeLabel } = props
+  const items = Array.isArray(children) ? children : [children]
+  return React.createElement('div', {
+    role: 'presentation',
+    style: { position: 'fixed', inset: 0, zIndex: 2147483000, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,.45)' },
+    onClick: onClose,
+  }, React.createElement('div', {
+    role: 'dialog',
+    'aria-modal': 'true',
+    'aria-label': typeof title === 'string' ? title : undefined,
+    style: { width: 'min(560px, 92vw)', maxHeight: '86vh', overflow: 'auto', padding: '18px 20px', borderRadius: '14px', background: 'var(--dsw-alias-bg-elevated, #1c1c1e)', color: 'var(--dsw-alias-label-primary, #eee)', boxShadow: '0 18px 60px rgba(0,0,0,.45)', fontSize: '13px' },
+    onClick: event => event.stopPropagation(),
+  },
+  React.createElement('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' } },
+    React.createElement('strong', { style: { fontSize: '15px' } }, title),
+    React.createElement('button', {
+      type: 'button', 'aria-label': closeLabel, onClick: onClose,
+      style: { background: 'none', border: 'none', color: 'inherit', cursor: 'pointer', fontSize: '16px' },
+    }, '×')),
+  ...items,
+  footer === undefined ? null : React.createElement('div', { style: { marginTop: '14px' } }, footer)))
+}
+
+/** Minimal button used with {@link FallbackModal}. */
+function FallbackButton(props) {
+  const { children, onClick, disabled } = props
+  return React.createElement('button', {
+    type: 'button', onClick, disabled,
+    style: { padding: '6px 14px', borderRadius: '8px', border: '1px solid var(--dsw-alias-border-secondary, #3a3a3c)', background: 'transparent', color: 'inherit', cursor: disabled === true ? 'not-allowed' : 'pointer', fontSize: '13px', opacity: disabled === true ? .5 : 1 },
+  }, children)
+}
+
+const { Modal = FallbackModal, Button = FallbackButton } = primitiveModule
 
 const DICT = {
   zh: {
@@ -342,8 +387,8 @@ const styles = {
 
 /** The confirmation dialog; it owns the request lifecycle for one session at a time. */
 function DeleteDialog(props) {
-  const request = props.useRequest()
-  const t = props.t
+  const request = typeof props.useRequest === 'function' ? props.useRequest() : null
+  if (request !== null) dialogRendered = true
   const [phase, setPhase] = React.useState({ kind: 'idle' })
   const [typed, setTyped] = React.useState('')
 
@@ -458,7 +503,9 @@ function DeleteDialog(props) {
       }
       if (data.eligible !== true) {
         const reason = Array.isArray(data.reasons) && data.reasons.length > 0 ? data.reasons[0] : null
-        children.push(React.createElement('div', { key: 'blocked', style: styles.notice },
+        // Unshifted so the refusal sits above the inventory: a blocked session
+        // must not read as a silent no-op.
+        children.unshift(React.createElement('div', { key: 'blocked', style: styles.warning },
           `${t2('dialog.blocked')} — ${t2('dialog.reasonPrefix')}${reason === null ? '' : t2(`reason.${reason.code}`)}`))
       }
       if (data.eligible === true && confirmRequired) {
@@ -518,48 +565,105 @@ function DeleteDialog(props) {
   }, ...children)
 }
 
+/**
+ * Show one diagnostic in the page itself.
+ *
+ * A Client half that fails to load leaves no visible trace — the context menu
+ * would simply do nothing — so failures are surfaced in the document
+ * independently of any slot, React, or the Host.
+ */
+function showBanner(text) {
+  try {
+    const existing = document.getElementById('session-delete-diagnostic')
+    const node = existing ?? document.createElement('div')
+    node.id = 'session-delete-diagnostic'
+    node.textContent = text
+    node.style.cssText = [
+      'position:fixed', 'z-index:2147483647', 'left:16px', 'bottom:16px', 'max-width:70vw',
+      'padding:10px 12px', 'border-radius:8px', 'background:#7f1d1d', 'color:#fff',
+      'font:13px/1.5 system-ui,sans-serif', 'white-space:pre-wrap',
+      'box-shadow:0 6px 24px rgba(0,0,0,.35)',
+    ].join(';')
+    if (existing === null) document.body.appendChild(node)
+    setTimeout(() => { node.remove() }, 20000)
+  } catch {
+    // Diagnostics must never become the failure they report.
+  }
+}
+
+/** Whether the overlay dialog has been registered into the shell slot. */
+let overlayReady = false
+
+/** Whether the dialog rendered for the latest request; a false value means the click was silent. */
+let dialogRendered = false
+
 /** Plugin `apply`: dictionaries, the context-menu contribution, and the overlay dialog. */
 function apply(ctx) {
-  const t = ctx.locale.bind(NS)
-  // Every language carries the English keys it does not translate, so `t`
-  // never falls back to a raw key for a locale with a partial dictionary.
-  for (const [locale, dict] of Object.entries(DICT)) {
-    try {
-      ctx.locale.register(NS, locale, { ...DICT.en, ...dict })
-    } catch (error) {
-      // A development reload re-applies this plugin; a duplicate registration
-      // must not take the sidebar down with it.
-      console.warn('session-delete: locale dictionary already registered', error)
+  try {
+    const t = ctx.locale.bind(NS)
+    // Every language carries the English keys it does not translate, so `t`
+    // never falls back to a raw key for a locale with a partial dictionary.
+    for (const [locale, dict] of Object.entries(DICT)) {
+      try {
+        ctx.locale.register(NS, locale, { ...DICT.en, ...dict })
+      } catch (error) {
+        // A development reload re-applies this plugin; a duplicate registration
+        // must not take the sidebar down with it.
+        console.warn('session-delete: locale dictionary already registered', error)
+      }
     }
+    const request = createSource(null)
+
+    ctx.effect(() => ctx.contextMenus.register({
+      id: 'sessionDelete.delete',
+      target: 'session',
+      order: MENU_ORDER,
+      resolve: (target) => [{
+        id: 'delete',
+        label: t('menu.deleteSession'),
+        icon: { key: 'workspace.delete' },
+        danger: true,
+        separatorBefore: true,
+        // The built-in archive entry lives in the popup footer, which renders
+        // after every ordinary item regardless of `order`; joining that group is
+        // what puts this entry directly below it.
+        afterContent: true,
+        failureLabel: t('failure.deleteSession'),
+        run: () => {
+          dialogRendered = false
+          request.set({ sessionId: target.sessionId, displayTitle: target.displayTitle })
+          if (!overlayReady) {
+            showBanner('session-delete: the shell.overlay slot is unavailable, so the confirmation dialog could not open')
+            return
+          }
+          setTimeout(() => {
+            if (!dialogRendered) {
+              showBanner('session-delete: the confirmation dialog did not render; the browser console holds the error')
+              console.error('session-delete: dialog did not render for the requested session')
+            }
+          }, 700)
+        },
+      }],
+    }), 'session-delete: context menu')
+
+    ctx.slots.inject('shell.overlay', () => {
+      overlayReady = true
+      return ctx.slots.register({
+        name: 'shell.overlay',
+        id: 'session-delete.dialog',
+        locale: NS,
+        inject: () => ({
+          hooks: { request },
+          dismiss: () => { request.set(null) },
+          refreshSessions: () => { void ctx.sessions.refresh() },
+          translate: t,
+        }),
+      }, DeleteDialog)
+    })
+  } catch (error) {
+    console.error('session-delete: client apply failed', error)
+    showBanner(`session-delete 客户端加载失败：${error instanceof Error ? error.message : String(error)}`)
   }
-  const request = createSource(null)
-
-  ctx.effect(() => ctx.contextMenus.register({
-    id: 'sessionDelete.delete',
-    target: 'session',
-    order: MENU_ORDER,
-    resolve: (target) => [{
-      id: 'delete',
-      label: t('menu.deleteSession'),
-      icon: { key: 'workspace.delete' },
-      danger: true,
-      separatorBefore: true,
-      failureLabel: t('failure.deleteSession'),
-      run: () => { request.set({ sessionId: target.sessionId, displayTitle: target.displayTitle }) },
-    }],
-  }), 'session-delete: context menu')
-
-  ctx.slots.inject('shell.overlay', () => ctx.slots.register({
-    name: 'shell.overlay',
-    id: 'session-delete.dialog',
-    locale: NS,
-    inject: () => ({
-      hooks: { request },
-      dismiss: () => { request.set(null) },
-      refreshSessions: () => { void ctx.sessions.refresh() },
-      translate: t,
-    }),
-  }, DeleteDialog))
 }
 
 module.exports = { name: 'session-delete', inject: ['contextMenus', 'slots', 'locale', 'sessions'], apply }
