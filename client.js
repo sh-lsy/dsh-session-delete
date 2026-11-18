@@ -259,7 +259,7 @@ const SESSION_DELETE_CSS = `
 .sd-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0 0 10px; }
 .sd-link { padding: 0; border: none; background: none; cursor: pointer; font-size: 12px; line-height: 18px; color: var(--dsw-alias-link); }
 .sd-days { width: 56px; height: 26px; padding: 2px 8px; border: 0.5px solid var(--dsw-alias-border-l4); border-radius: var(--dsw-radius-sm); background: transparent; color: var(--dsw-alias-label-primary); font-size: 12px; }
-.sd-list-box { margin: 0 0 12px; border: 0.5px solid var(--dsw-alias-border-l4); border-radius: var(--dsw-radius-sm); }
+.sd-list-box { max-height: min(300px, 40vh); overflow-y: auto; overscroll-behavior: contain; margin: 0 0 12px; border: 0.5px solid var(--dsw-alias-border-l4); border-radius: var(--dsw-radius-sm); }
 .sd-row { display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px; cursor: pointer; }
 .sd-row:hover { background: var(--dsw-alias-interactive-bg-hover); }
 .sd-row + .sd-row { border-top: 0.5px solid var(--dsw-alias-border-l4); }
