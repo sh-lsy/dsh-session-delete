@@ -231,7 +231,7 @@ const DICT = {
 // stop-and-archive confirmation.
 const SESSION_DELETE_CSS = `
 .sd-dialog { width: min(440px, 100%); max-height: 100%; overflow: hidden; }
-.sd-batch-dialog { width: min(480px, 100%); max-height: 100%; overflow: hidden; }
+.sd-batch-dialog { width: min(560px, 100%); max-height: 100%; overflow: hidden; }
 @supports (height: 100dvh) {
   .sd-dialog, .sd-batch-dialog { max-height: calc(100dvh - 48px); }
 }
@@ -259,15 +259,14 @@ const SESSION_DELETE_CSS = `
 .sd-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0 0 10px; }
 .sd-link { padding: 0; border: none; background: none; cursor: pointer; font-size: 12px; line-height: 18px; color: var(--dsw-alias-link); }
 .sd-days { width: 56px; height: 26px; padding: 2px 8px; border: 0.5px solid var(--dsw-alias-border-l4); border-radius: var(--dsw-radius-sm); background: transparent; color: var(--dsw-alias-label-primary); font-size: 12px; }
-.sd-list-box { max-height: min(300px, 40vh); overflow-y: auto; overscroll-behavior: contain; margin: 0 0 12px; border: 0.5px solid var(--dsw-alias-border-l4); border-radius: var(--dsw-radius-sm); }
-.sd-row { display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px; cursor: pointer; }
+.sd-list-box { max-height: min(360px, 48vh); overflow-y: auto; overscroll-behavior: contain; margin: 0 0 12px; border: 0.5px solid var(--dsw-alias-border-l4); border-radius: var(--dsw-radius-sm); }
+.sd-row { display: flex; align-items: center; gap: 10px; height: 40px; padding: 0 12px; cursor: pointer; }
 .sd-row:hover { background: var(--dsw-alias-interactive-bg-hover); }
 .sd-row + .sd-row { border-top: 0.5px solid var(--dsw-alias-border-l4); }
-.sd-check { margin-top: 3px; accent-color: var(--dsw-alias-link); }
-.sd-row-main { min-width: 0; flex: 1; }
-.sd-row-title { font-size: 13px; line-height: 20px; color: var(--dsw-alias-label-primary); overflow-wrap: anywhere; }
-.sd-row-meta { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-caption); }
-.sd-badge { font-size: 11px; line-height: 16px; color: var(--dsw-alias-state-warn-primary); }
+.sd-check { flex: none; margin: 0; accent-color: var(--dsw-alias-link); }
+.sd-row-title { flex: 1; min-width: 0; font-size: 13px; line-height: 20px; color: var(--dsw-alias-label-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sd-row-meta { flex: none; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-caption); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.sd-badge { flex: none; font-size: 11px; line-height: 16px; color: var(--dsw-alias-state-warn-primary); }
 .sd-deep { display: flex; align-items: flex-start; gap: 8px; margin: 0 0 4px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }
 `
 
@@ -643,12 +642,10 @@ function BatchDialog(props) {
               type: 'checkbox', className: 'sd-check', checked: selected.has(id),
               onChange: () => { toggle(id) },
             }),
-            React.createElement('span', { className: 'sd-row-main' },
-              React.createElement('span', { className: 'sd-row-title' },
-                titleOf(id),
-                session.runningTurn === true ? React.createElement('span', { className: 'sd-badge' }, ` · ${t2('batch.live')}`) : null),
-              React.createElement('span', { className: 'sd-row-meta' },
-                t2('batch.meta').replace('{size}', formatSize(session.sizeBytes)).replace('{time}', formatTime(session.lastActivity)))),
+            React.createElement('span', { className: 'sd-row-title', title: titleOf(id) }, titleOf(id)),
+            session.runningTurn === true ? React.createElement('span', { className: 'sd-badge' }, t2('batch.live')) : null,
+            React.createElement('span', { className: 'sd-row-meta' },
+              t2('batch.meta').replace('{size}', formatSize(session.sizeBytes)).replace('{time}', formatTime(session.lastActivity))),
           )
         }),
       ))
@@ -667,9 +664,8 @@ function BatchDialog(props) {
       deep ? t2('batch.confirmDeep') : t2('batch.confirmNoDeep')))
     const chosen = sessions.filter(session => selected.has(session.sessionId))
     const chosenRows = chosen.map(session => React.createElement('div', { key: session.sessionId, className: 'sd-row' },
-      React.createElement('span', { className: 'sd-row-main' },
-        React.createElement('span', { className: 'sd-row-title' }, titleOf(session.sessionId)),
-        React.createElement('span', { className: 'sd-row-meta' }, formatSize(session.sizeBytes)))))
+      React.createElement('span', { className: 'sd-row-title', title: titleOf(session.sessionId) }, titleOf(session.sessionId)),
+      React.createElement('span', { className: 'sd-row-meta' }, formatSize(session.sizeBytes))))
     children.push(React.createElement('div', { key: 'confirm-list', className: 'sd-list-box', role: 'group', 'aria-label': t2('batch.confirmDelete') }, chosenRows))
   }
   if (phase.kind === 'done') {
