@@ -208,6 +208,15 @@ export function textOf(content) {
   return content.filter(block => block?.type === 'text').map(block => block.text ?? '').join('\n')
 }
 
+/** Recursively freeze a plain value so a constructed message is immutable. */
+function deepFreeze(value) {
+  Object.freeze(value)
+  for (const child of Object.values(value)) {
+    if (child !== null && typeof child === 'object') deepFreeze(child)
+  }
+  return value
+}
+
 /** Resolve the turn, fork boundary, and undone prompt for a message id. */
 export function resolveRewind(events, messageId) {
   let turn
@@ -439,13 +448,15 @@ export async function prepare(ctx, config, executable, snapshots, body) {
   }
 
   // Commit the in-place surface replacement: same session, view truncated.
-  // Imported lazily so the module loads under plain-node unit tests; at runtime
-  // the profile's linked-root resolution maps the core package.
-  const { createUserMessage } = await import('@deepseek-ai/dsh-llm')
-  range.session.append('user/message', createUserMessage({
+  // The marker is built inline (a frozen user message) so the plugin needs no
+  // core-package import, which the external plugin's resolution cannot provide.
+  const marker = deepFreeze({
+    id: randomUUID(),
+    role: 'user',
     content: [{ type: 'text', text: '[rewound]' }],
     source: { kind: 'user' },
-  }), {
+  })
+  range.session.append('user/message', marker, {
     surfaceOp: { op: 'replace', startSeq: range.startSeq, endSeq: range.endSeq },
     sourceEventSeqs: range.shadowed,
   })
