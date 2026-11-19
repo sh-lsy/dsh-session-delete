@@ -739,13 +739,13 @@ const UNDO_DICT = {
   zh: {
     'action.undo': '回退此轮',
     'dialog.title': '回退此轮对话',
-    'dialog.warning': '将还原这一轮改过的文件（该轮之后被改过的文件会跳过、不动），继续到一个新会话并删除原会话；不影响你最新的其他改动',
+    'dialog.warning': '将在当前会话原地回退这一轮：还原该轮改过的文件（之后被改过的跳过、不动），把提示词放回输入框；不影响你最新的其他改动',
     'dialog.cancel': '取消',
     'dialog.confirm': '回退',
     'dialog.working': '正在回退…',
     'dialog.done': '完成',
     'dialog.doneTitle': '已回退',
-    'dialog.doneDesc': '已打开继续会话，提示词已放回输入框',
+    'dialog.doneDesc': '已回退，提示词已放回输入框',
     'dialog.doneReverted': '已还原 {n} 个文件',
     'dialog.doneConflicts': '{n} 个文件在该轮之后被修改过，已跳过、未改动',
     'dialog.failed': '回退失败：',
@@ -759,13 +759,13 @@ const UNDO_DICT = {
   en: {
     'action.undo': 'Undo this turn',
     'dialog.title': 'Undo this turn',
-    'dialog.warning': 'Reverts the files this turn changed (files modified after this turn are skipped, untouched), continues in a new session and deletes the original; your other latest changes are not affected',
+    'dialog.warning': 'Rewinds this turn in place in the current session: reverts the files it changed (later-modified files are skipped, untouched) and restores the prompt to the composer; your other latest changes are not affected',
     'dialog.cancel': 'Cancel',
     'dialog.confirm': 'Undo',
     'dialog.working': 'Undoing…',
     'dialog.done': 'Done',
     'dialog.doneTitle': 'Undone',
-    'dialog.doneDesc': 'Opened the continuation session with the prompt restored to the composer',
+    'dialog.doneDesc': 'Rewound; the prompt is restored to the composer',
     'dialog.doneReverted': 'Reverted {n} file(s)',
     'dialog.doneConflicts': '{n} file(s) were modified after this turn and were skipped (untouched)',
     'dialog.failed': 'Undo failed: ',
@@ -828,33 +828,15 @@ function prefillDraft(ctx, sessionId, prompt) {
   attempt()
 }
 
-/** Run the full undo: prepare (revert files) → fork → open → restore prompt. */
+/** Run the undo in place: the Host reverts the turn's files and shadows the turn
+ * from the conversation surface in the SAME session; restore the prompt to the
+ * composer. No fork, no new window, no session deletion (opencode-style). */
 async function runUndo(ctx, request) {
   const prepared = await post('/session-undo/prepare', { sessionId: request.sessionId, messageId: request.messageId })
   if (prepared?.ok !== true) return { ok: false, code: prepared?.code, message: prepared?.message }
-  const { boundary, prompt, turn } = prepared.data
-  let childId
-  try {
-    childId = await ctx.sessions.fork({ sessionId: request.sessionId, atSeq: boundary })
-  } catch (error) {
-    return { ok: false, code: 'fork-failed', message: error instanceof Error ? error.message : String(error) }
-  }
-  // The fork inherits the undone turn's queue-insert splice but not its claim,
-  // which would leave the prompt pending in the queue (auto-sent with the next
-  // message). Clear the inherited inbox so the prompt becomes a composer draft.
-  try {
-    await post('/session-undo/clear-queue', { sessionId: childId })
-  } catch { /* best-effort; the prefill below still sets the draft */ }
-  ctx.uiWorkspace.openSession(childId)
-  prefillDraft(ctx, childId, prompt)
-  // Option 1: discard the original session (the undone turns) so the sidebar
-  // keeps a single continuing session and disk does not accumulate. Workspace
-  // files are untouched by session deletion; only the snapshot revert above
-  // changed files, and it skipped anything modified after the turn.
-  try {
-    await post('/session-delete/delete', { sessionId: request.sessionId, stopActivity: true, acknowledged: true })
-  } catch { /* best-effort; the fork already succeeded */ }
-  return { ok: true, turn, childId, reverted: prepared.data.reverted ?? [], conflicts: prepared.data.conflicts ?? [] }
+  const { prompt, turn } = prepared.data
+  prefillDraft(ctx, request.sessionId, prompt)
+  return { ok: true, turn, reverted: prepared.data.reverted ?? [], conflicts: prepared.data.conflicts ?? [] }
 }
 
 /** The undo confirmation dialog hosted in shell.overlay. */

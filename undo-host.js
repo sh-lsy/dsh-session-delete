@@ -13,7 +13,7 @@
  *
  * @module @sh-lsy/dsh-session-delete/undo-host
  */
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -373,7 +373,30 @@ async function serveUndo(ctx, req, res, peer, run) {
   }
 }
 
-/** Revert the working tree to the target turn's start snapshot; return boundary + prompt. */
+/**
+ * Validate the live session and locate the surface range to rewind.
+ *
+ * The conversation is rewound in place (opencode-style): a surface replacement
+ * shadows every model-visible node after the boundary, keeping the same session
+ * and the append-only durable log. The first surface node (system prompt) is
+ * protected, so rewinding before the first message is refused.
+ * @returns the session and replacement range, or a refusal code.
+ */
+export function surfaceRewindRange(ctx, sessionId, boundary) {
+  const session = ctx.get('sessions')?.get(sessionId)
+  if (session === undefined) return { code: 'not-live', message: 'open the session before undoing' }
+  const nodes = session.surface.nodes
+  const startIdx = nodes.findIndex(seq => seq > boundary)
+  if (startIdx < 0) return { code: 'nothing-to-rewind', message: 'no conversation after this point' }
+  if (startIdx === 0) return { code: 'no-prior-turn', message: 'cannot rewind before the first message' }
+  return { session, startSeq: nodes[startIdx], endSeq: nodes[nodes.length - 1], shadowed: nodes.slice(startIdx) }
+}
+
+/**
+ * Undo one turn in place: revert the turn's own file changes (conflict-aware)
+ * and shadow the turn from the model-visible conversation surface, keeping the
+ * same session. Returns the undone prompt for the composer.
+ */
 export async function prepare(ctx, config, executable, snapshots, body) {
   const sessionId = body.sessionId
   const messageId = body.messageId
@@ -393,18 +416,41 @@ export async function prepare(ctx, config, executable, snapshots, body) {
   if (rewind.code !== undefined) {
     return { ok: false, code: rewind.code, message: `cannot undo: ${rewind.code}` }
   }
+  // Validate the in-place conversation rewind before touching any files.
+  const range = surfaceRewindRange(ctx, sessionId, rewind.boundary)
+  if (range.code !== undefined) return { ok: false, code: range.code, message: range.message }
+
+  // File revert is best-effort: conversation rewind works even without a snapshot.
+  let reverted = []
+  let conflicts = []
+  let fileSnapshot = false
   const snapshot = snapshots.get(`${sessionId}#${rewind.turn}`)
-  if (snapshot === undefined || snapshot.startTree == null || snapshot.endTree == null) {
-    return { ok: false, code: 'no-snapshot', message: 'no complete file snapshot for this turn (snapshots disabled, expired, or the turn predates the plugin)' }
+  if (snapshot?.startTree != null && snapshot?.endTree != null) {
+    const exe = await executable()
+    if (exe !== null) {
+      const workspace = await locateWorkspace(ctx, config, exe, snapshot.cwd, new AbortController().signal)
+      if (workspace !== null) {
+        const result = await revertTurn(ctx, config, exe, workspace, snapshot.startTree, snapshot.endTree, new AbortController().signal)
+        reverted = result.reverted
+        conflicts = result.conflicts
+        fileSnapshot = true
+      }
+    }
   }
-  const exe = await executable()
-  if (exe === null) return { ok: false, code: 'no-git', message: 'git is unavailable' }
-  const signal = new AbortController().signal
-  const workspace = await locateWorkspace(ctx, config, exe, snapshot.cwd, signal)
-  if (workspace === null) return { ok: false, code: 'no-git', message: 'the workspace is no longer a git repository' }
-  const result = await revertTurn(ctx, config, exe, workspace, snapshot.startTree, snapshot.endTree, signal)
-  ctx.logger.info('session-undo: reverted %s turn %d (%d files, %d conflicts skipped)', sessionId, rewind.turn, result.reverted.length, result.conflicts.length)
-  return { ok: true, data: { boundary: rewind.boundary, prompt: rewind.prompt, turn: rewind.turn, reverted: result.reverted, conflicts: result.conflicts, cwd: snapshot.cwd } }
+
+  // Commit the in-place surface replacement: same session, view truncated.
+  // Imported lazily so the module loads under plain-node unit tests; at runtime
+  // the profile's linked-root resolution maps the core package.
+  const { createUserMessage } = await import('@deepseek-ai/dsh-llm')
+  range.session.append('user/message', createUserMessage({
+    content: [{ type: 'text', text: '[rewound]' }],
+    source: { kind: 'user' },
+  }), {
+    surfaceOp: { op: 'replace', startSeq: range.startSeq, endSeq: range.endSeq },
+    sourceEventSeqs: range.shadowed,
+  })
+  ctx.logger.info('session-undo: rewound %s turn %d in place (%d files reverted, %d conflicts)', sessionId, rewind.turn, reverted.length, conflicts.length)
+  return { ok: true, data: { prompt: rewind.prompt, turn: rewind.turn, reverted, conflicts, fileSnapshot } }
 }
 
 /** List the recorded turn snapshots for one session, newest first. */

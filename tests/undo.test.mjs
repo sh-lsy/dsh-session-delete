@@ -14,7 +14,7 @@ import test from 'node:test'
 import { promisify } from 'node:util'
 
 import {
-  clearQueue, locateWorkspace, resolveRewind, resolveUndoConfig, revertTurn, snapshotTree, textOf,
+  clearQueue, locateWorkspace, resolveRewind, resolveUndoConfig, revertTurn, snapshotTree, surfaceRewindRange, textOf,
 } from '../undo-host.js'
 
 const execFileAsync = promisify(execFile)
@@ -186,4 +186,21 @@ test('clearQueue clears the live continuation inbox and refuses a non-live sessi
   assert.equal(cleared, 1)
   assert.equal(clearQueue(ctx, { sessionId: 'cold' }).ok, false)
   assert.equal(clearQueue(ctx, {}).code, 'bad-request')
+})
+
+test('surfaceRewindRange locates the tail range and protects the first node', () => {
+  const session = { surface: { nodes: [1, 2, 5, 6] } }
+  const ctx = { get: (name) => name === 'sessions' ? { get: (id) => id === 'live' ? session : undefined } : undefined }
+  // boundary 3 (before turn 2): tail is nodes 5,6.
+  const range = surfaceRewindRange(ctx, 'live', 3)
+  assert.equal(range.startSeq, 5)
+  assert.equal(range.endSeq, 6)
+  assert.deepEqual(range.shadowed, [5, 6])
+  assert.equal(range.session, session)
+  // boundary 0 would remove node 0 (system prompt) -> refused.
+  assert.equal(surfaceRewindRange(ctx, 'live', 0).code, 'no-prior-turn')
+  // boundary past the last node -> nothing to rewind.
+  assert.equal(surfaceRewindRange(ctx, 'live', 9).code, 'nothing-to-rewind')
+  // cold session -> not live.
+  assert.equal(surfaceRewindRange(ctx, 'cold', 3).code, 'not-live')
 })

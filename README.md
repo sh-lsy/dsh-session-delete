@@ -105,11 +105,11 @@ Confirming it:
 1. **Reverts the files that turn changed** — and only those. Each turn records a
    start and end snapshot; undo diffs them to find the turn's own changes, then
    reverts a file only if its current content still matches the turn's end state.
-2. **Forks a continuation session** inheriting every earlier turn, opens it, and
-   **deletes the original session** (the undone turns). DSH's log is append-only,
-   so rewind is a fork rather than an in-place truncation; deleting the original
-   keeps a single continuing session and avoids disk accumulation.
-3. **Restores the prompt** of the undone turn to the new session's composer.
+2. **Rewinds the conversation in place** (opencode-style): a surface replacement
+   shadows that turn and everything after it from the model-visible view, in the
+   **same session**. The append-only durable log is untouched; no new session or
+   window is created. A small `[rewound]` marker notes the cut point.
+3. **Restores the prompt** of the undone turn to the current session's composer.
 
 **Your latest code is safe.** A file modified *after* the undone turn is skipped
 and reported as a conflict (left untouched); a file the turn never touched is
@@ -149,7 +149,7 @@ Both require `peer.principal.kind === 'owner'`. The Web half (`client.js`) is a 
 - A live Session's in-memory object stays attached after deletion (Harness has no public eviction API). It is archived, so it runs no further turn and appends nothing; the sidebar row is removed on refresh. The orphan is released when the process exits.
 - A deleted Session's id stays in the Workspace registry's in-memory header index until the next start; the row is removed immediately and the stale index entry is unreachable from the UI.
 - Lineage: deleting a Session that other Sessions forked from leaves their `parentSession` pointing at nothing. The dialog warns with the child count; only the displayed lineage is affected.
-- Undo snapshots start at install/restart; earlier turns have none. A nested directory that is itself a git repo is snapshotted as a gitlink, not file-by-file. Undo rewinds by forking then deleting the original session (not in-place truncation); the undone turns are discarded permanently (no redo). Only the turn's own changes are reverted; files modified afterward are skipped.
+- Undo snapshots start at install/restart; earlier turns have none. A nested directory that is itself a git repo is snapshotted as a gitlink, not file-by-file. Undo rewinds the conversation in place via a surface replacement (same session; the durable log keeps the undone turns). Only the turn's own changes are reverted; files modified afterward are skipped. The session must be open (live) to undo.
 - The undo icon sits in the assistant message action strip (beside copy); the user-message icon row has no plugin slot.
 
 ## Development
