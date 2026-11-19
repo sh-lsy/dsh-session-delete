@@ -800,6 +800,7 @@ function UndoAction(props) {
 
 /** Restore the prompt to a session's composer draft once its shell is ready. */
 function prefillDraft(ctx, sessionId, prompt) {
+  console.log('[session-undo] prefill start', { sessionId, promptLen: prompt.length, hasScope: typeof ctx.sessions.scope, hasInput: typeof ctx.uiConversation?.input })
   if (prompt === '') return
   let tries = 0
   let reasserted = false
@@ -808,15 +809,15 @@ function prefillDraft(ctx, sessionId, prompt) {
     if (actx === undefined) return false
     try {
       ctx.uiConversation.input.for(actx).setDraft(prompt)
+      console.log('[session-undo] setDraft ok', { sessionId, tries })
       return true
-    } catch {
+    } catch (error) {
+      console.warn('[session-undo] setDraft threw', error)
       return false
     }
   }
   const attempt = () => {
     if (write()) {
-      // Re-assert once after the shell finishes initializing, so a late
-      // persisted-draft load does not replace the restored prompt.
       if (!reasserted) {
         reasserted = true
         setTimeout(write, 400)
@@ -824,6 +825,7 @@ function prefillDraft(ctx, sessionId, prompt) {
       return
     }
     if (tries++ < 50) setTimeout(attempt, 100)
+    else console.warn('[session-undo] prefill gave up: scope never ready', { sessionId })
   }
   attempt()
 }
@@ -833,6 +835,7 @@ function prefillDraft(ctx, sessionId, prompt) {
  * composer. No fork, no new window, no session deletion (opencode-style). */
 async function runUndo(ctx, request) {
   const prepared = await post('/session-undo/prepare', { sessionId: request.sessionId, messageId: request.messageId })
+  console.log('[session-undo] prepare result', prepared)
   if (prepared?.ok !== true) return { ok: false, code: prepared?.code, message: prepared?.message }
   const { prompt, turn } = prepared.data
   prefillDraft(ctx, request.sessionId, prompt)
