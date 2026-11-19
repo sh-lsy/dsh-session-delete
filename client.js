@@ -798,36 +798,35 @@ function UndoAction(props) {
     }, React.createElement(UndoIcon)))
 }
 
-/** Restore the prompt to a session's composer draft once its shell is ready. */
+/** Restore the prompt to a session's composer draft; resolves true on success. */
 function prefillDraft(ctx, sessionId, prompt) {
-  console.log('[session-undo] prefill start', { sessionId, promptLen: prompt.length, hasScope: typeof ctx.sessions.scope, hasInput: typeof ctx.uiConversation?.input })
-  if (prompt === '') return
-  let tries = 0
-  let reasserted = false
-  const write = () => {
-    const actx = ctx.sessions.scope?.(sessionId)
-    if (actx === undefined) return false
-    try {
-      ctx.uiConversation.input.for(actx).setDraft(prompt)
-      console.log('[session-undo] setDraft ok', { sessionId, tries })
-      return true
-    } catch (error) {
-      console.warn('[session-undo] setDraft threw', error)
-      return false
-    }
-  }
-  const attempt = () => {
-    if (write()) {
-      if (!reasserted) {
-        reasserted = true
-        setTimeout(write, 400)
+  return new Promise((resolve) => {
+    if (prompt === '') { resolve(false); return }
+    let tries = 0
+    let settled = false
+    const finish = (ok) => { if (!settled) { settled = true; resolve(ok) } }
+    const write = () => {
+      const actx = ctx.sessions.scope?.(sessionId)
+      if (actx === undefined) return false
+      try {
+        ctx.uiConversation.input.for(actx).setDraft(prompt)
+        return true
+      } catch (error) {
+        console.warn('[session-undo] setDraft threw', error)
+        return false
       }
-      return
     }
-    if (tries++ < 50) setTimeout(attempt, 100)
-    else console.warn('[session-undo] prefill gave up: scope never ready', { sessionId })
-  }
-  attempt()
+    const attempt = () => {
+      if (write()) {
+        // Re-assert once after the shell finishes initializing, then report.
+        setTimeout(() => { write(); finish(true) }, 400)
+        return
+      }
+      if (tries++ < 50) setTimeout(attempt, 100)
+      else finish(false)
+    }
+    attempt()
+  })
 }
 
 /** Run the undo in place: the Host reverts the turn's files and shadows the turn
@@ -838,8 +837,8 @@ async function runUndo(ctx, request) {
   console.log('[session-undo] prepare result', prepared)
   if (prepared?.ok !== true) return { ok: false, code: prepared?.code, message: prepared?.message }
   const { prompt, turn } = prepared.data
-  prefillDraft(ctx, request.sessionId, prompt)
-  return { ok: true, turn, reverted: prepared.data.reverted ?? [], conflicts: prepared.data.conflicts ?? [] }
+  const prefillOk = await prefillDraft(ctx, request.sessionId, prompt)
+  return { ok: true, turn, prefillOk, fileSnapshot: prepared.data.fileSnapshot === true, reverted: prepared.data.reverted ?? [], conflicts: prepared.data.conflicts ?? [] }
 }
 
 /** The undo confirmation dialog hosted in shell.overlay. */
@@ -859,7 +858,7 @@ function UndoDialog(props) {
     setPhase({ kind: 'working' })
     const result = await props.confirmUndo(request)
     setPhase(result?.ok === true
-      ? { kind: 'done', turn: result.turn, reverted: result.reverted ?? [], conflicts: result.conflicts ?? [] }
+      ? { kind: 'done', turn: result.turn, prefillOk: result.prefillOk === true, fileSnapshot: result.fileSnapshot === true, reverted: result.reverted ?? [], conflicts: result.conflicts ?? [] }
       : { kind: 'error', code: result?.code, message: result?.message })
   }
   const footer = (() => {
@@ -876,6 +875,8 @@ function UndoDialog(props) {
     children.push(React.createElement('div', { key: 'done-desc', className: 'su-text' }, t2('dialog.doneDesc')))
     children.push(React.createElement('div', { key: 'done-reverted', className: 'su-text' },
       t2('dialog.doneReverted').replace('{n}', String((phase.reverted ?? []).length))))
+    children.push(React.createElement('div', { key: 'done-diag', className: 'su-text', style: { fontSize: '12px', color: 'var(--dsw-alias-label-caption)' } },
+      `诊断：提示词回填=${phase.prefillOk ? '成功' : '失败'} · 文件快照=${phase.fileSnapshot ? '有' : '无'} · turn=${phase.turn}`))
     if ((phase.conflicts ?? []).length > 0) {
       children.push(React.createElement('div', { key: 'done-conflicts', className: 'su-error' },
         t2('dialog.doneConflicts').replace('{n}', String(phase.conflicts.length))))
