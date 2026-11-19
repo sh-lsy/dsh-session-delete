@@ -762,6 +762,10 @@ const UNDO_DICT = {
     'dialog.fileRestore': '还原',
     'dialog.fileRemove': '删除',
     'dialog.fileConflict': '跳过',
+    'picker.search': '搜索要回退到的消息…',
+    'picker.empty': '没有可回退的消息',
+    'picker.noResults': '没有匹配的消息',
+    'picker.noText': '（无文本）',
     'dialog.working': '正在回退…',
     'dialog.done': '完成',
     'dialog.doneTitle': '已回退',
@@ -793,6 +797,10 @@ const UNDO_DICT = {
     'dialog.fileRestore': 'restore',
     'dialog.fileRemove': 'remove',
     'dialog.fileConflict': 'skip',
+    'picker.search': 'Search for the message to rewind to…',
+    'picker.empty': 'No messages to rewind to',
+    'picker.noResults': 'No matching messages',
+    'picker.noText': '(no text)',
     'dialog.working': 'Rewinding…',
     'dialog.done': 'Done',
     'dialog.doneTitle': 'Rewound',
@@ -1406,11 +1414,53 @@ function apply(ctx) {
     // Hide withdrawn transcript rows for executed rewinds (private chat-builder
     // seam; shape-checked and restored on unload, degrades gracefully).
     installChatViewVisibility(ctx)
+
+    // Bare /rewind opens the harness popupSelect candidate picker (native ↑↓/
+    // Enter/Esc keyboard navigation). Picking a candidate opens the mode dialog.
+    const commandUi = ctx.get('commandUi')
+    if (commandUi !== undefined && typeof commandUi.decorate === 'function') {
+      const candidatesCache = new Map()
+      const fetchCandidates = async (sessionId) => {
+        try {
+          const res = await post('/session-undo/candidates', { sessionId })
+          return res?.ok === true ? res.data.candidates : []
+        } catch { return [] }
+      }
+      const clock = (time) => {
+        const d = new Date(time)
+        return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+      }
+      ctx.effect(() => commandUi.decorate({
+        name: 'rewind',
+        available: (session) => {
+          const face = ctx.sessions.binding(session.sessionId)?.session
+          return face !== undefined && face.getSnapshot().subagent == null
+        },
+        ui: {
+          kind: 'popupSelect',
+          searchLabels: () => ({ placeholder: tu('picker.search'), empty: tu('picker.empty'), noResults: tu('picker.noResults') }),
+          options: async (session) => {
+            const candidates = await fetchCandidates(session.sessionId)
+            candidatesCache.set(session.sessionId, candidates)
+            return candidates.map(candidate => ({
+              id: String(candidate.seq),
+              label: candidate.preview || tu('picker.noText'),
+              detail: clock(candidate.time),
+            }))
+          },
+          onSelect: (option, session) => {
+            const candidate = (candidatesCache.get(session.sessionId) ?? []).find(item => String(item.seq) === option.id)
+            if (candidate === undefined) return
+            undoRequest.set({ sessionId: session.sessionId, seq: candidate.seq, text: candidate.text })
+          },
+        },
+      }), 'session-undo /rewind decoration')
+    }
   } catch (error) {
     console.error('session-delete: client apply failed', error)
     showBanner(`session-delete 客户端加载失败：${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
-module.exports = { name: 'session-delete', inject: ['contextMenus', 'slots', 'locale', 'sessions', 'uiWorkspace', 'uiConversation'], apply, __rewindTest: { rewindCutsOf, rewindTargetSeqOfArgs, RewindVisibilityBuilder } }
+module.exports = { name: 'session-delete', inject: ['contextMenus', 'slots', 'locale', 'sessions', 'uiWorkspace', 'uiConversation', 'commandUi'], apply, __rewindTest: { rewindCutsOf, rewindTargetSeqOfArgs, RewindVisibilityBuilder } }
 return module.exports; } });

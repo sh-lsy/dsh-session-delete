@@ -24,6 +24,7 @@ const SNAPSHOTS_PATH = '/session-undo/snapshots'
 const PURGE_PATH = '/session-undo/purge'
 const CLEAR_QUEUE_PATH = '/session-undo/clear-queue'
 const PREVIEW_PATH = '/session-undo/preview'
+const CANDIDATES_PATH = '/session-undo/candidates'
 const DAY_MS = 86_400_000
 const STDERR_TAIL_BYTES = 16 * 1024
 const TERMINATE_GRACE_MS = 2_000
@@ -360,6 +361,7 @@ export function mountUndo(ctx, config) {
   route(PURGE_PATH, () => purge(ctx, config, snapshots, persist))
   route(CLEAR_QUEUE_PATH, body => clearQueue(ctx, body))
   route(PREVIEW_PATH, body => previewRewind(ctx, config, executable, snapshots, body))
+  route(CANDIDATES_PATH, body => listCandidates(ctx, body))
 
   // The /rewind engine command: the client drives it with `@<seq> <mode>`; the
   // command node durably records the marker seq (outcome.sourceEventSeq) so the
@@ -592,6 +594,36 @@ export async function previewRewind(ctx, config, executable, snapshots, body) {
   if (workspace === null) return empty
   const files = await previewTurn(ctx, config, exe, workspace, snapshot.startTree, snapshot.endTree, new AbortController().signal)
   return { ok: true, data: { fileSnapshot: true, files } }
+}
+
+/** The constant marker content; such rows are rewind markers, not candidates. */
+const MARKER_TEXT = '(empty message)'
+
+/**
+ * List the rewind candidates of a live session: human user messages still on the
+ * model surface, newest first (the top row is the most recent / default pick).
+ * Withdrawn messages and rewind markers are excluded. Cold sessions list nothing.
+ * @param body - `{ sessionId }`.
+ * @returns `{ candidates: [{seq, time, preview}] }`.
+ */
+export function listCandidates(ctx, body) {
+  const sessionId = body.sessionId
+  if (typeof sessionId !== 'string') return { ok: false, code: 'bad-request', message: 'sessionId is required' }
+  const session = ctx.get('sessions')?.get(sessionId)
+  if (session === undefined) return { ok: true, data: { candidates: [] } }
+  const surface = new Set(session.surface.nodes)
+  const events = session.snapshotEvents()
+  const candidates = []
+  for (let index = events.length - 1; index >= 0 && candidates.length < 100; index--) {
+    const event = events[index]
+    if (event.type !== 'user/message' || event.data?.source?.kind !== 'user') continue
+    if (!surface.has(event.seq)) continue
+    const text = textOf(event.data.content).replace(/\s+/gu, ' ').trim()
+    if (text === MARKER_TEXT || text === '[rewound]') continue
+    const preview = text.length <= 80 ? text : `${text.slice(0, 79)}…`
+    candidates.push({ seq: event.seq, time: event.time, preview, text })
+  }
+  return { ok: true, data: { candidates } }
 }
 
 /**

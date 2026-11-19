@@ -1,7 +1,7 @@
 {
   "name": "@sh-lsy/dsh-session-delete",
   "version": "0.2.0",
-  "description": "Session cleanup and turn undo for DeepSeek Harness: delete sessions (single/batch) with artifact and attachment GC, and undo a turn (revert files, fork, restore prompt)",
+  "description": "Session cleanup and in-place conversation rewind for DeepSeek Harness: delete sessions (single/batch) with artifact and attachment GC, and rewind to any earlier user message in the same session (opencode/Claude Code-style) with conflict-aware file restore, a mode chooser, and a /rewind candidate picker",
   "type": "module",
   "main": "index.js",
   "exports": {

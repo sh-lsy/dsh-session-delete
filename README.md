@@ -6,9 +6,12 @@ A DeepSeek Harness **bundle plugin** for session cleanup and turn undo:
 
 - **Delete sessions** (single or batch) from the sidebar context menu, including
   artifact cleanup and an optional reference-counted attachment GC.
-- **Undo a turn** from an icon on each assistant message: revert the files the
-  turn changed, fork a continuation session, and restore the prompt to the
-  composer (in the spirit of opencode `/undo` and Antigravity rewind).
+- **Rewind the conversation** from a ↶ icon on each user message: pick a mode
+  (conversation only, or conversation + files with a file-list confirmation),
+  withdraw that message and everything after it in the **same session**,
+  conflict-aware revert the files it changed, and restore the prompt to the
+  composer. Also via `/rewind` with a keyboard-navigable candidate picker (in the
+  spirit of opencode `/undo`, Claude Code `/rewind`, and Antigravity rewind).
 
 It is installed into a profile, so it lives **outside** the Harness repository: pulling upstream Harness code never touches it.
 
@@ -97,33 +100,52 @@ The workspace right-click menu gains **Clean up sessions** (above "delete worksp
 
 Confirming deletes the selected sessions through the same safe path as a single deletion (stop running work, archive, await the turn, remove the directory), then runs the attachment GC and reports deleted counts and freed bytes.
 
-## Turn undo
+## Conversation rewind (opencode / Claude Code-style)
 
-An undo icon (↶) appears in each assistant message's action strip, beside copy.
-Confirming it:
+A rewind icon (↶, "Rewind to here") appears in each **user message's** action row.
+Clicking it opens a mode chooser:
 
-1. **Reverts the files that turn changed** — and only those. Each turn records a
-   start and end snapshot; undo diffs them to find the turn's own changes, then
-   reverts a file only if its current content still matches the turn's end state.
-2. **Rewinds the conversation in place** (opencode-style): a surface replacement
-   shadows that turn and everything after it from the model-visible view, in the
-   **same session**. The append-only durable log is untouched; no new session or
-   window is created. A small `[rewound]` marker notes the cut point.
-3. **Restores the prompt** of the undone turn to the current session's composer.
+- **Conversation only** — withdraws that message and everything after it from the
+  conversation; files are left untouched.
+- **Conversation and files** — first shows the list of files that turn changed
+  (restore / remove, with later-modified files flagged as *skipped*), then asks
+  for confirmation before reverting them together with the conversation.
 
-**Your latest code is safe.** A file modified *after* the undone turn is skipped
-and reported as a conflict (left untouched); a file the turn never touched is
-never modified. So undoing an old turn never clobbers newer work. The result
-dialog reports how many files were reverted and how many were skipped.
+You can also type **`/rewind`** in the composer: a candidate picker lists the
+reachable user messages (newest first, searchable) with native **↑/↓ / Enter /
+Esc** keyboard navigation; picking one opens the same mode chooser. The
+parameterized form `/rewind @<seq> chat|both` executes directly.
+
+How it works (two halves):
+
+1. **Model context** — the Host appends a surface-replace marker that shadows the
+   target message and everything after it, in the **same session**. The
+   append-only durable log is never rewritten; no fork, no new window.
+2. **Rendered transcript** — a client wrapper over the chat view builder hides the
+   withdrawn rows (DSH's surface replacement alone only cuts the model context).
+   The cut span is derived from the durable rewind command node, so hiding
+   survives a page reload.
+3. **Prompt restored** — the withdrawn message's text is put back into the
+   composer (facade `setDraft`, with a DOM fallback) to edit and re-send.
+
+**Your latest code is safe.** File revert is conflict-aware: only files the turn
+changed are considered, and a file modified *after* the turn is skipped (left
+untouched); a file the turn never touched is never modified. Rewinding an old
+turn never clobbers newer work.
 
 Snapshots use a **shadow git repository** under the plugin data root (the
-opencode approach), so undo works for **git and non-git workspaces alike** and
-never touches your own repository. A workspace's `.gitignore` is respected, plus
-`snapshotExcludes` (heavy dirs like `node_modules`). A running turn is refused
-(`session-busy`); undo asks for confirmation first. Limits: snapshots are
-recorded from install/restart onward and purged after `retentionDays`; subagent
-sessions are not snapshotted; a nested directory that is itself a git repo is
-recorded as a gitlink, not file-by-file.
+opencode approach), so file restore works for **git and non-git workspaces alike**
+and never touches your own repository. `.gitignore` and `snapshotExcludes` (heavy
+dirs like `node_modules`) are respected. A running turn is stopped before
+rewinding; subagent sessions are rewind-inert. Limits: snapshots are recorded
+from install/restart onward and purged after `retentionDays`; a message already
+shadowed by compaction cannot be rewound to (it is no longer in the model
+context); a nested git directory is snapshotted as a gitlink, not file-by-file.
+
+The transcript-hiding and user-row seams are private DSH surfaces: both are
+shape-checked and restored on unload, so a DSH upgrade degrades gracefully
+(model rewind + file restore + prompt refill still work) rather than breaking the
+plugin or the delete feature.
 
 ## Install
 
@@ -149,8 +171,8 @@ Both require `peer.principal.kind === 'owner'`. The Web half (`client.js`) is a 
 - A live Session's in-memory object stays attached after deletion (Harness has no public eviction API). It is archived, so it runs no further turn and appends nothing; the sidebar row is removed on refresh. The orphan is released when the process exits.
 - A deleted Session's id stays in the Workspace registry's in-memory header index until the next start; the row is removed immediately and the stale index entry is unreachable from the UI.
 - Lineage: deleting a Session that other Sessions forked from leaves their `parentSession` pointing at nothing. The dialog warns with the child count; only the displayed lineage is affected.
-- Undo snapshots start at install/restart; earlier turns have none. A nested directory that is itself a git repo is snapshotted as a gitlink, not file-by-file. Undo rewinds the conversation in place via a surface replacement (same session; the durable log keeps the undone turns). Only the turn's own changes are reverted; files modified afterward are skipped. The session must be open (live) to undo.
-- The undo icon sits in the assistant message action strip (beside copy); the user-message icon row has no plugin slot.
+- Rewind snapshots start at install/restart; earlier turns have none (file restore falls back to conversation-only). A nested directory that is itself a git repo is snapshotted as a gitlink, not file-by-file. Rewind cuts the model context via a surface replacement and hides the transcript client-side (same session; the durable log keeps the withdrawn turns). Only the turn's own changes are reverted; files modified afterward are skipped. A message already shadowed by compaction cannot be rewound to.
+- The ↶ action mounts on the user/steering message row by taking over the shipped row component (a private seam, shape-checked and restored on unload); the transcript-hiding wraps the chat view builder (also private). Both degrade gracefully if a DSH upgrade changes their shape.
 
 ## Development
 

@@ -14,7 +14,7 @@ import test from 'node:test'
 import { promisify } from 'node:util'
 
 import {
-  clearQueue, executeRewind, locateWorkspace, previewTurn, resolveRewind, resolveUndoConfig, revertTurn, snapshotTree, surfaceRangeBySeq, surfaceRewindRange, textOf, turnOfSeq,
+  clearQueue, executeRewind, listCandidates, locateWorkspace, previewTurn, resolveRewind, resolveUndoConfig, revertTurn, snapshotTree, surfaceRangeBySeq, surfaceRewindRange, textOf, turnOfSeq,
 } from '../undo-host.js'
 
 const execFileAsync = promisify(execFile)
@@ -291,4 +291,23 @@ test('previewTurn lists the turn file impact with actions and conflicts (dry-run
     await rm(dir, { recursive: true, force: true })
     await rm(data, { recursive: true, force: true })
   }
+})
+
+test('listCandidates lists surface user messages newest first, excluding markers and withdrawn rows', () => {
+  const events = [
+    { seq: 1, type: 'user/message', time: 100, data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'first prompt' }] } },
+    { seq: 2, type: 'assistant/message', data: { turn: 1, message: { id: 'a1' } } },
+    { seq: 5, type: 'user/message', time: 200, data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'second prompt' }] } },
+    { seq: 6, type: 'assistant/message', data: { turn: 2, message: { id: 'a2' } } },
+    { seq: 8, type: 'user/message', time: 300, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '(empty message)' }] } },
+    { seq: 9, type: 'user/message', time: 400, data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'withdrawn' }] } },
+  ]
+  // surface excludes seq 9 (withdrawn); includes the marker seq 8 (filtered by content).
+  const session = { surface: { nodes: [1, 2, 5, 6, 8] }, snapshotEvents: () => events }
+  const ctx = { get: (name) => name === 'sessions' ? { get: (id) => id === 'live' ? session : undefined } : undefined }
+  const result = listCandidates(ctx, { sessionId: 'live' })
+  assert.equal(result.ok, true)
+  assert.deepEqual(result.data.candidates.map(candidate => candidate.seq), [5, 1])
+  assert.equal(result.data.candidates[0].text, 'second prompt')
+  assert.equal(listCandidates(ctx, { sessionId: 'cold' }).data.candidates.length, 0)
 })
