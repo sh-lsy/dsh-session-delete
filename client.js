@@ -798,23 +798,31 @@ function UndoAction(props) {
     }, React.createElement(UndoIcon)))
 }
 
-/** Restore the prompt to a session's composer once its shell is ready. */
+/** Restore the prompt to a session's composer draft once its shell is ready. */
 function prefillDraft(ctx, sessionId, prompt) {
   if (prompt === '') return
   let tries = 0
-  const attempt = () => {
+  let reasserted = false
+  const write = () => {
+    const actx = ctx.sessions.scope?.(sessionId)
+    if (actx === undefined) return false
     try {
-      const binding = ctx.sessions.binding(sessionId)
-      if (binding !== undefined) {
-        const result = ctx.uiConversation.input.requestDraftInitialization(binding, { prompt, clearPreviousDraft: true })
-        if (result === 'applied') return
+      ctx.uiConversation.input.for(actx).setDraft(prompt)
+      return true
+    } catch {
+      return false
+    }
+  }
+  const attempt = () => {
+    if (write()) {
+      // Re-assert once after the shell finishes initializing, so a late
+      // persisted-draft load does not replace the restored prompt.
+      if (!reasserted) {
+        reasserted = true
+        setTimeout(write, 400)
       }
-      const actx = ctx.sessions.scope?.(sessionId)
-      if (actx !== undefined) {
-        ctx.uiConversation.input.for(actx).setDraft(prompt)
-        return
-      }
-    } catch { /* retry until the session shell is ready */ }
+      return
+    }
     if (tries++ < 50) setTimeout(attempt, 100)
   }
   attempt()
@@ -827,21 +835,16 @@ async function runUndo(ctx, request) {
   const { boundary, prompt, turn } = prepared.data
   let childId
   try {
-    childId = await ctx.sessions.fork({
-      sessionId: request.sessionId,
-      atSeq: boundary,
-      onCreated: (id) => {
-        try {
-          const binding = ctx.sessions.binding(id)
-          if (binding !== undefined) {
-            ctx.uiConversation.input.requestDraftInitialization(binding, { prompt, clearPreviousDraft: true })
-          }
-        } catch { /* the post-open prefill is the fallback */ }
-      },
-    })
+    childId = await ctx.sessions.fork({ sessionId: request.sessionId, atSeq: boundary })
   } catch (error) {
     return { ok: false, code: 'fork-failed', message: error instanceof Error ? error.message : String(error) }
   }
+  // The fork inherits the undone turn's queue-insert splice but not its claim,
+  // which would leave the prompt pending in the queue (auto-sent with the next
+  // message). Clear the inherited inbox so the prompt becomes a composer draft.
+  try {
+    await post('/session-undo/clear-queue', { sessionId: childId })
+  } catch { /* best-effort; the prefill below still sets the draft */ }
   ctx.uiWorkspace.openSession(childId)
   prefillDraft(ctx, childId, prompt)
   // Option 1: discard the original session (the undone turns) so the sidebar

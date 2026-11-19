@@ -22,6 +22,7 @@ import { join } from 'node:path'
 const PREPARE_PATH = '/session-undo/prepare'
 const SNAPSHOTS_PATH = '/session-undo/snapshots'
 const PURGE_PATH = '/session-undo/purge'
+const CLEAR_QUEUE_PATH = '/session-undo/clear-queue'
 const DAY_MS = 86_400_000
 const STDERR_TAIL_BYTES = 16 * 1024
 const TERMINATE_GRACE_MS = 2_000
@@ -326,6 +327,26 @@ export function mountUndo(ctx, config) {
   route(PREPARE_PATH, body => prepare(ctx, config, executable, snapshots, body))
   route(SNAPSHOTS_PATH, body => listSnapshots(snapshots, body))
   route(PURGE_PATH, () => purge(ctx, config, snapshots, persist))
+  route(CLEAR_QUEUE_PATH, body => clearQueue(ctx, body))
+}
+
+/**
+ * Clear a forked continuation's inherited pending inbox.
+ *
+ * A fork cut before a turn inherits that turn's queue-insert splice but not its
+ * claim, leaving the undone prompt pending in the child's queue. Clearing it
+ * lets the prompt be restored as a composer draft instead of auto-sending.
+ * @param ctx - Host context.
+ * @param body - `{ sessionId }` of the live continuation.
+ * @returns ok, or a refusal when the agent is not live.
+ */
+export function clearQueue(ctx, body) {
+  const sessionId = body.sessionId
+  if (typeof sessionId !== 'string') return { ok: false, code: 'bad-request', message: 'sessionId is required' }
+  const agent = ctx.get('agents')?.get(sessionId)
+  if (agent === undefined) return { ok: false, code: 'not-live', message: 'the continuation agent is not live' }
+  agent.inbox.clear()
+  return { ok: true }
 }
 
 async function serveUndo(ctx, req, res, peer, run) {

@@ -14,7 +14,7 @@ import test from 'node:test'
 import { promisify } from 'node:util'
 
 import {
-  locateWorkspace, resolveRewind, resolveUndoConfig, revertTurn, snapshotTree, textOf,
+  clearQueue, locateWorkspace, resolveRewind, resolveUndoConfig, revertTurn, snapshotTree, textOf,
 } from '../undo-host.js'
 
 const execFileAsync = promisify(execFile)
@@ -177,4 +177,13 @@ test('locateWorkspace builds a shadow repo for a non-git directory', async () =>
     await rm(dir, { recursive: true, force: true })
     await rm(data, { recursive: true, force: true })
   }
+})
+
+test('clearQueue clears the live continuation inbox and refuses a non-live session', () => {
+  let cleared = 0
+  const ctx = { get: (name) => name === 'agents' ? { get: (id) => id === 'live' ? { inbox: { clear: () => { cleared++ } } } : undefined } : undefined }
+  assert.deepEqual(clearQueue(ctx, { sessionId: 'live' }), { ok: true })
+  assert.equal(cleared, 1)
+  assert.equal(clearQueue(ctx, { sessionId: 'cold' }).ok, false)
+  assert.equal(clearQueue(ctx, {}).code, 'bad-request')
 })
