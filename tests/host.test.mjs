@@ -32,9 +32,11 @@ function makeContext(options = {}) {
   const pinned = new Set(options.pinned ?? [])
   const workspaces = options.workspaces ?? []
   const routes = new Map()
+  const commands = []
   const agentState = { status: options.agentStatus ?? 'idle' }
   return {
     routes,
+    commands,
     archived,
     pinned,
     agentState,
@@ -62,6 +64,10 @@ function makeContext(options = {}) {
     parallel: async () => undefined,
     effect: (fn) => fn(),
     on: () => () => {},
+    inject: (_names, cb) => {
+      cb({ effect: (fn) => fn(), commands: { register: (def) => { commands.push(def); return () => {} } } })
+      return () => {}
+    },
     get: (name) => {
       if (name === 'agents' && options.live === true) return { get: () => agentState }
       if (name === 'sessions' && options.live === true) return { get: () => ({ header: {} }) }
@@ -121,6 +127,7 @@ test('apply registers the delete and undo owner-only POST routes', () => {
     assert.equal(route.kind, 'exact')
     assert.equal(route.auth, 'required')
   }
+  assert.deepEqual(ctx.commands.map(command => command.name), ['rewind'])
 })
 
 test('inspect reports the inventory and blocks a missing session', async () => {

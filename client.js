@@ -737,44 +737,46 @@ function BatchDialog(props) {
 const UNDO_NS = 'sessionUndo'
 const UNDO_DICT = {
   zh: {
-    'action.undo': '回退此轮',
-    'dialog.title': '回退此轮对话',
-    'dialog.warning': '将在当前会话原地回退这一轮：还原该轮改过的文件（之后被改过的跳过、不动），把提示词放回输入框；不影响你最新的其他改动',
+    'action.undo': '回退到此处',
+    'dialog.title': '回退对话',
+    'dialog.warning': '将在当前会话原地回退到这条消息之前：撤回这条消息及之后的对话，还原其间改过的文件（之后被改过的跳过、不动），并把这条消息的提示词放回输入框；不影响你最新的其他改动',
     'dialog.cancel': '取消',
     'dialog.confirm': '回退',
     'dialog.working': '正在回退…',
     'dialog.done': '完成',
     'dialog.doneTitle': '已回退',
     'dialog.doneDesc': '已回退，提示词已放回输入框',
-    'dialog.doneReverted': '已还原 {n} 个文件',
-    'dialog.doneConflicts': '{n} 个文件在该轮之后被修改过，已跳过、未改动',
+    'dialog.prefillFailed': '提示词未能自动填入输入框，请手动输入',
     'dialog.failed': '回退失败：',
-    'reason.session-busy': '该会话正在运行轮次，请先停止再回退',
-    'reason.no-snapshot': '这一轮没有文件快照（快照未启用、已过期，或该轮在插件启用前）',
-    'reason.no-git': 'git 不可用或工作区不是 git 仓库',
-    'reason.no-prior-turn': '这是第一轮，没有可回退的前序状态',
-    'reason.message-not-found': '找不到该消息对应的轮次',
-    'reason.fork-failed': '分叉继续会话失败：',
+    'reason.session-busy': '该会话正在运行轮次且无法停止，请先停止再回退',
+    'reason.no-prior-turn': '这是第一条消息，没有可回退的前序状态',
+    'reason.not-on-surface': '该消息已不在模型上下文中（被压缩遮掉），无法回退到此处',
+    'reason.not-a-user-message': '目标不是用户消息',
+    'reason.subagent': '子代理会话不支持回退',
+    'reason.not-live': '会话不可用，请先打开该会话',
+    'reason.command-failed': '回退命令执行出错：',
+    'reason.not-matched': '回退命令未执行：',
   },
   en: {
-    'action.undo': 'Undo this turn',
-    'dialog.title': 'Undo this turn',
-    'dialog.warning': 'Rewinds this turn in place in the current session: reverts the files it changed (later-modified files are skipped, untouched) and restores the prompt to the composer; your other latest changes are not affected',
+    'action.undo': 'Rewind to here',
+    'dialog.title': 'Rewind conversation',
+    'dialog.warning': 'Rewinds in place in the current session to before this message: withdraws this message and everything after it, reverts the files changed in between (later-modified files are skipped, untouched), and restores this message\'s prompt to the composer; your other latest changes are not affected',
     'dialog.cancel': 'Cancel',
-    'dialog.confirm': 'Undo',
-    'dialog.working': 'Undoing…',
+    'dialog.confirm': 'Rewind',
+    'dialog.working': 'Rewinding…',
     'dialog.done': 'Done',
-    'dialog.doneTitle': 'Undone',
+    'dialog.doneTitle': 'Rewound',
     'dialog.doneDesc': 'Rewound; the prompt is restored to the composer',
-    'dialog.doneReverted': 'Reverted {n} file(s)',
-    'dialog.doneConflicts': '{n} file(s) were modified after this turn and were skipped (untouched)',
-    'dialog.failed': 'Undo failed: ',
-    'reason.session-busy': 'The session is running a turn; stop it before undoing',
-    'reason.no-snapshot': 'No file snapshot for this turn (snapshots disabled, expired, or the turn predates the plugin)',
-    'reason.no-git': 'git is unavailable or the workspace is not a git repository',
-    'reason.no-prior-turn': 'This is the first turn; there is no prior state to revert to',
-    'reason.message-not-found': 'No turn found for this message',
-    'reason.fork-failed': 'Forking the continuation session failed: ',
+    'dialog.prefillFailed': 'The prompt could not be auto-filled into the composer; please type it manually',
+    'dialog.failed': 'Rewind failed: ',
+    'reason.session-busy': 'The session is running a turn and could not be stopped; stop it before rewinding',
+    'reason.no-prior-turn': 'This is the first message; there is no prior state to rewind to',
+    'reason.not-on-surface': 'This message is no longer in the model context (shadowed by compaction); cannot rewind to it',
+    'reason.not-a-user-message': 'The target is not a user message',
+    'reason.subagent': 'Subagent sessions cannot be rewound',
+    'reason.not-live': 'The session is unavailable; open it first',
+    'reason.command-failed': 'The rewind command errored: ',
+    'reason.not-matched': 'The rewind command did not run: ',
   },
 }
 
@@ -788,57 +790,24 @@ function UndoIcon() {
   React.createElement('path', { d: 'M2.5 7h6.5a4 4 0 0 1 0 8H7' }))
 }
 
-/** The undo icon contribution rendered in the assistant action strip. */
-function UndoAction(props) {
-  const label = typeof props.t === 'function' ? props.t('action.undo') : 'Undo this turn'
-  return React.createElement(Tooltip, { label, side: 'bottom' },
-    React.createElement('button', {
-      type: 'button', className: 'su-action', 'aria-label': label,
-      onClick: () => { props.undo(props.messageId) },
-    }, React.createElement(UndoIcon)))
-}
-
-/** Restore the prompt to a session's composer draft; resolves true on success. */
-function prefillDraft(ctx, sessionId, prompt) {
-  return new Promise((resolve) => {
-    if (prompt === '') { resolve(false); return }
-    let tries = 0
-    let settled = false
-    const finish = (ok) => { if (!settled) { settled = true; resolve(ok) } }
-    const write = () => {
-      const actx = ctx.sessions.scope?.(sessionId)
-      if (actx === undefined) return false
-      try {
-        ctx.uiConversation.input.for(actx).setDraft(prompt)
-        return true
-      } catch (error) {
-        console.warn('[session-undo] setDraft threw', error)
-        return false
-      }
-    }
-    const attempt = () => {
-      if (write()) {
-        // Re-assert once after the shell finishes initializing, then report.
-        setTimeout(() => { write(); finish(true) }, 400)
-        return
-      }
-      if (tries++ < 50) setTimeout(attempt, 100)
-      else finish(false)
-    }
-    attempt()
-  })
-}
-
-/** Run the undo in place: the Host reverts the turn's files and shadows the turn
- * from the conversation surface in the SAME session; restore the prompt to the
- * composer. No fork, no new window, no session deletion (opencode-style). */
+/** Run the undo in place via the /rewind engine command, then refill the composer
+ * with the withdrawn prompt. Same session, no fork (opencode-style). The request
+ * is a user-message row {sessionId, seq, text}: seq is the target, text the prompt. */
 async function runUndo(ctx, request) {
-  const prepared = await post('/session-undo/prepare', { sessionId: request.sessionId, messageId: request.messageId })
-  console.log('[session-undo] prepare result', prepared)
-  if (prepared?.ok !== true) return { ok: false, code: prepared?.code, message: prepared?.message }
-  const { prompt, turn } = prepared.data
-  const prefillOk = await prefillDraft(ctx, request.sessionId, prompt)
-  return { ok: true, turn, prefillOk, fileSnapshot: prepared.data.fileSnapshot === true, reverted: prepared.data.reverted ?? [], conflicts: prepared.data.conflicts ?? [] }
+  const { sessionId, seq, text } = request
+  const face = ctx.sessions.binding(sessionId)?.session
+  if (face === undefined) return { ok: false, code: 'not-live', message: '会话不可用' }
+  let result
+  try {
+    result = await face.command(`/rewind @${seq} both`)
+  } catch (error) {
+    return { ok: false, code: 'command-failed', message: error instanceof Error ? error.message : String(error) }
+  }
+  if (result?.ok !== true || result.value?.matched !== true) {
+    return { ok: false, code: 'not-matched', message: result?.error?.message ?? '回退命令未执行' }
+  }
+  const prefillOk = await refillComposer(ctx, sessionId, text)
+  return { ok: true, prefillOk }
 }
 
 /** The undo confirmation dialog hosted in shell.overlay. */
@@ -858,7 +827,7 @@ function UndoDialog(props) {
     setPhase({ kind: 'working' })
     const result = await props.confirmUndo(request)
     setPhase(result?.ok === true
-      ? { kind: 'done', turn: result.turn, prefillOk: result.prefillOk === true, fileSnapshot: result.fileSnapshot === true, reverted: result.reverted ?? [], conflicts: result.conflicts ?? [] }
+      ? { kind: 'done', prefillOk: result.prefillOk === true }
       : { kind: 'error', code: result?.code, message: result?.message })
   }
   const footer = (() => {
@@ -873,13 +842,8 @@ function UndoDialog(props) {
   if (phase.kind === 'done') {
     children.push(React.createElement('div', { key: 'done-title', className: 'su-text', style: { fontWeight: 500, color: 'var(--dsw-alias-label-primary)' } }, t2('dialog.doneTitle')))
     children.push(React.createElement('div', { key: 'done-desc', className: 'su-text' }, t2('dialog.doneDesc')))
-    children.push(React.createElement('div', { key: 'done-reverted', className: 'su-text' },
-      t2('dialog.doneReverted').replace('{n}', String((phase.reverted ?? []).length))))
-    children.push(React.createElement('div', { key: 'done-diag', className: 'su-text', style: { fontSize: '12px', color: 'var(--dsw-alias-label-caption)' } },
-      `诊断：提示词回填=${phase.prefillOk ? '成功' : '失败'} · 文件快照=${phase.fileSnapshot ? '有' : '无'} · turn=${phase.turn}`))
-    if ((phase.conflicts ?? []).length > 0) {
-      children.push(React.createElement('div', { key: 'done-conflicts', className: 'su-error' },
-        t2('dialog.doneConflicts').replace('{n}', String(phase.conflicts.length))))
+    if (!phase.prefillOk) {
+      children.push(React.createElement('div', { key: 'done-prefill', className: 'su-error' }, t2('dialog.prefillFailed')))
     }
   } else {
     children.push(React.createElement('div', { key: 'warning', className: 'su-notice' }, t2('dialog.warning')))
@@ -896,6 +860,366 @@ function UndoDialog(props) {
     open: request !== null, onClose: close, closeLabel: t2('dialog.cancel'),
     title: t2('dialog.title'), className: 'su-dialog', contentClassName: 'su-content', footer,
   }, ...children)
+}
+
+// === In-place rewind: chat-snapshot visibility wrapper (ported from dsh-rewind) ===
+// DSH's surface replacement cuts only the model context; the rendered transcript
+// keeps the shadowed rows. This wraps the registered `chat` view builder and marks
+// nodes inside an executed rewind's [target, marker] span hidden. The seam is
+// private (uiConversation.views / definition.create); its shape is checked and it
+// is restored on unload, so a DSH change degrades gracefully instead of crashing.
+const REWIND_COMMANDS = new Set(['rewind'])
+
+function rewindTargetSeqOfArgs(args) {
+  const match = /@(\d+)/.exec(typeof args === 'string' ? args : '')
+  return match ? Number(match[1]) : undefined
+}
+
+function rewindCutsOf(nodes) {
+  const cuts = []
+  for (const node of nodes) {
+    if (node.kind !== 'command') continue
+    const command = node.data
+    if (command?.name == null || !REWIND_COMMANDS.has(command.name)) continue
+    const args = command.args ?? ''
+    if (args.includes('preview') || args.includes('__candidates')) continue
+    if (command.outcome?.kind !== 'success') continue
+    const marker = command.outcome.sourceEventSeq
+    if (marker === undefined) continue
+    const target = rewindTargetSeqOfArgs(args)
+    if (target === undefined || target > marker) continue
+    cuts.push({ target, marker })
+  }
+  return cuts
+}
+
+function rewindHidden(node) {
+  return node.visibility === 'hidden' ? node : { ...node, visibility: 'hidden' }
+}
+function rewindTurnOf(node) {
+  const turn = node.location?.turn?.turn
+  return typeof turn === 'number' ? turn : undefined
+}
+function rewindChanged(input) {
+  return input.changedTurns === undefined ? {} : { changedTurns: input.changedTurns }
+}
+
+class RewindVisibilityBuilder {
+  constructor(inner) {
+    this.inner = inner
+    this.originals = new Map()
+    this.commands = new Map()
+    this.byTurn = new Map()
+    this.turnProcess = new Map()
+    this.derived = new Map()
+    this.cuts = []
+    this.cutSignature = '[]'
+    this.lastSignature = '[]'
+  }
+  get empty() { return this.inner.empty }
+  replace(input) {
+    this.setAll(input.nodes)
+    this.lastSignature = this.cutSignature
+    return this.inner.replace({ nodes: this.deriveAll(), timeline: input.timeline, ...rewindChanged(input) })
+  }
+  apply(input) {
+    const affected = new Set()
+    let commandsChanged = false
+    for (const node of input.upserts) {
+      const previous = this.originals.get(node.key)
+      const previousTurn = previous === undefined ? undefined : rewindTurnOf(previous)
+      const nextTurn = rewindTurnOf(node)
+      if (previousTurn !== undefined) affected.add(previousTurn)
+      if (nextTurn !== undefined) affected.add(nextTurn)
+      if (previous?.kind === 'command' || node.kind === 'command') commandsChanged = true
+      this.setOriginal(node)
+    }
+    if (commandsChanged) this.refreshCuts()
+    if (this.cutSignature !== this.lastSignature) {
+      this.lastSignature = this.cutSignature
+      return this.inner.replace({ nodes: this.deriveAll(), timeline: input.timeline, ...rewindChanged(input) })
+    }
+    const cuts = this.cuts
+    const upserts = new Map()
+    for (const node of input.upserts) upserts.set(node.key, this.deriveOne(node, cuts))
+    for (const turn of affected) {
+      const processKey = this.turnProcess.get(turn)
+      const base = processKey === undefined ? undefined : this.originals.get(processKey)
+      if (base === undefined) continue
+      const next = this.deriveTurnProcess(base, cuts, turn, this.deriveOne(base, cuts))
+      if (this.derived.get(processKey) !== next) upserts.set(processKey, next)
+    }
+    const list = [...upserts.values()]
+    for (const node of list) this.derived.set(node.key, node)
+    return this.inner.apply({ upserts: list, timeline: input.timeline, ...rewindChanged(input) })
+  }
+  groupInput() { return this.inner.groupInput?.() }
+  publish() { this.inner.publish?.() }
+  setAll(nodes) {
+    this.originals.clear(); this.commands.clear(); this.byTurn.clear(); this.turnProcess.clear(); this.derived.clear()
+    for (const node of nodes) this.setOriginal(node)
+    this.refreshCuts()
+  }
+  setOriginal(node) {
+    const previous = this.originals.get(node.key)
+    if (previous !== undefined) this.unindex(previous)
+    this.originals.set(node.key, node)
+    if (node.kind === 'command') this.commands.set(node.key, node)
+    const turn = rewindTurnOf(node)
+    if (turn === undefined) return
+    const members = this.byTurn.get(turn) ?? new Map()
+    members.set(node.key, node)
+    this.byTurn.set(turn, members)
+    if (node.kind === 'turn-process') this.turnProcess.set(turn, node.key)
+  }
+  unindex(node) {
+    if (node.kind === 'command') this.commands.delete(node.key)
+    const turn = rewindTurnOf(node)
+    if (turn === undefined) return
+    const members = this.byTurn.get(turn)
+    if (members === undefined) return
+    members.delete(node.key)
+    if (members.size === 0) this.byTurn.delete(turn)
+    if (node.kind === 'turn-process' && this.turnProcess.get(turn) === node.key) {
+      this.turnProcess.delete(turn)
+      for (const member of members.values()) {
+        if (member.kind === 'turn-process') { this.turnProcess.set(turn, member.key); break }
+      }
+    }
+  }
+  refreshCuts() {
+    this.cuts = rewindCutsOf(this.commands.values())
+    this.cutSignature = JSON.stringify(this.cuts.map(cut => `${cut.target}:${cut.marker}`).sort())
+  }
+  deriveAll() {
+    const cuts = this.cuts
+    const derived = new Map()
+    for (const node of this.originals.values()) derived.set(node.key, this.deriveOne(node, cuts))
+    for (const [turn, key] of this.turnProcess) {
+      const base = this.originals.get(key)
+      if (base === undefined) continue
+      const current = derived.get(key) ?? this.deriveOne(base, cuts)
+      derived.set(key, this.deriveTurnProcess(base, cuts, turn, current))
+    }
+    const result = [...derived.values()]
+    this.derived = derived
+    return result
+  }
+  deriveOne(node, cuts) {
+    const base = this.originals.get(node.key) ?? node
+    if (base.kind === 'command') {
+      const command = base.data
+      if (command?.name != null && REWIND_COMMANDS.has(command.name)) {
+        const args = command.args ?? ''
+        const probe = args.includes('preview') || args.includes('__candidates')
+        const executed = command.outcome?.kind === 'success' && command.outcome.sourceEventSeq !== undefined
+        if (probe || executed) return rewindHidden(base)
+      }
+      return base
+    }
+    const contained = cuts.some(cut => cut.target <= base.anchorSeq && base.anchorSeq <= cut.marker)
+    return contained ? rewindHidden(base) : base
+  }
+  deriveTurnProcess(base, cuts, turn = rewindTurnOf(base), current = this.deriveOne(base, cuts)) {
+    if (turn === undefined || current.visibility === 'hidden') return current
+    const members = this.byTurn.get(turn)
+    if (members === undefined) return current
+    let count = 0
+    let allHidden = true
+    for (const member of members.values()) {
+      if (member.key === base.key) continue
+      count += 1
+      if (this.deriveOne(member, cuts).visibility !== 'hidden') { allHidden = false; break }
+    }
+    if (count === 0) return current
+    return allHidden ? rewindHidden(base) : current
+  }
+}
+
+function installChatViewVisibility(ctx) {
+  const patches = new Map()
+  let currentCleanup
+  const rebuildOpenSessions = (ui) => {
+    const state = ctx.sessions?.list?.getSnapshot?.()
+    if (state === undefined) return
+    const ids = new Set([...(state.ids ?? []), ...Object.keys(state.byId ?? {})])
+    for (const id of ids) {
+      const retained = state.byId?.[id]?.retainedBy
+      if (retained === undefined || !Object.values(retained).some(count => (count ?? 0) > 0)) continue
+      try { ui.binding?.(id)?.rebuild?.() } catch { /* best-effort */ }
+    }
+  }
+  const restorePatches = () => {
+    for (const [definition, record] of patches) {
+      if (definition.create === record.wrapper) definition.create = record.original
+    }
+    patches.clear()
+  }
+  const installOn = (ui) => {
+    currentCleanup?.(); currentCleanup = undefined
+    if (ui?.views === undefined) return
+    const views = ui.views
+    const ensure = () => {
+      try {
+        const definition = views.entries().find(candidate => candidate.target === 'chat')
+        if (definition === undefined || typeof definition.create !== 'function') return
+        const current = patches.get(definition)
+        const create = definition.create
+        if (current !== undefined && create === current.wrapper) return
+        const wrapper = function wrappedChatBuilder() { return new RewindVisibilityBuilder(create.call(definition)) }
+        definition.create = wrapper
+        patches.set(definition, { original: create, wrapper })
+        rebuildOpenSessions(ui)
+      } catch { /* shape mismatch: degrade gracefully, never crash */ }
+    }
+    let unsubscribe
+    try { unsubscribe = views.subscribe?.(ensure) } catch { /* ignore */ }
+    ensure()
+    currentCleanup = () => { unsubscribe?.(); restorePatches(); rebuildOpenSessions(ui) }
+  }
+  const start = () => {
+    let scope
+    if (typeof ctx.inject === 'function') {
+      scope = ctx.inject(['uiConversation'], (child) => installOn(child.get('uiConversation')))
+    } else {
+      installOn(ctx.get?.('uiConversation') ?? ctx.uiConversation)
+    }
+    return () => { currentCleanup?.(); currentCleanup = undefined; if (typeof scope === 'function') scope() }
+  }
+  if (typeof ctx.effect === 'function') ctx.effect(start, 'session-undo chat visibility')
+  else start()
+}
+
+// === User-message ↶ mount (ported from dsh-rewind mount.tsx) ===
+// Takes over the shipped user/steering row component in the conversation.chat.node
+// slot and adds the rewind action to the row's actions row via extraActions. The
+// row gives {sessionId, seq, text} directly (seq = target, text = prompt). Private
+// seam: shape-checked, restores the original component identity on unload.
+const CHAT_NODE_SLOT = 'conversation.chat.node'
+const ROW_KEYS = new Set(['user', 'steering'])
+const SHIPPED_ROW_PRIORITY = 0
+const ROW_TICK_KEY = 'session-undo:mount'
+
+function rowRendererOf(component) {
+  if (typeof component === 'function') return component
+  if (component === null || typeof component !== 'object') return undefined
+  const type = component.type
+  return typeof type === 'function' ? type : undefined
+}
+
+function rowTargetOf(props) {
+  const sessionId = props.sessionId
+  const data = props.node?.data
+  if (typeof sessionId !== 'string' || typeof data?.seq !== 'number' || typeof data?.time !== 'number') return undefined
+  return { sessionId, seq: data.seq, time: data.time }
+}
+
+function rowWithAction(official, render) {
+  return function RowWithAction(props) {
+    const row = official(typeof props.renderSlotChain === 'function' ? props : { ...props, renderSlotChain: () => null })
+    const target = rowTargetOf(props)
+    if (target === undefined || !React.isValidElement(row)) return row
+    const actions = row.props.actions
+    if (typeof actions !== 'function') return row
+    const withAction = (text) => {
+      const actionsRow = actions(text)
+      if (!React.isValidElement(actionsRow)) return actionsRow
+      try {
+        const element = render({ ...target, text })
+        if (element === null || element === undefined) return actionsRow
+        const existing = actionsRow.props.extraActions
+        return React.cloneElement(actionsRow, { extraActions: React.createElement(React.Fragment, null, existing, element) })
+      } catch {
+        return actionsRow
+      }
+    }
+    return React.cloneElement(row, { actions: withAction })
+  }
+}
+
+function installRowAction(slots, render) {
+  if (typeof slots?.entries !== 'function') return () => {}
+  const taken = new Map()
+  const takeOver = (entry) => {
+    if (taken.has(entry)) return false
+    const official = rowRendererOf(entry.component)
+    if (official === undefined) return false
+    const replacement = rowWithAction(official, render)
+    taken.set(entry, { original: entry.component, replacement })
+    entry.component = replacement
+    return true
+  }
+  const tick = () => {
+    if (typeof slots.register !== 'function') return
+    try { slots.register({ name: CHAT_NODE_SLOT, key: ROW_TICK_KEY }, () => null)() } catch { /* ignore */ }
+  }
+  const sync = () => {
+    let changed = false
+    for (const entry of slots.entries(CHAT_NODE_SLOT)) {
+      const key = entry.options?.key
+      if (key === undefined || !ROW_KEYS.has(key)) continue
+      if ((entry.options?.priority ?? SHIPPED_ROW_PRIORITY) !== SHIPPED_ROW_PRIORITY) continue
+      changed = takeOver(entry) || changed
+    }
+    if (changed) tick()
+  }
+  sync()
+  const unsubscribe = slots.subscribe?.(CHAT_NODE_SLOT, sync)
+  return () => {
+    unsubscribe?.()
+    for (const [entry, record] of taken) {
+      if (entry.component === record.replacement) entry.component = record.original
+    }
+    taken.clear()
+  }
+}
+
+/** The ↶ action rendered inside a user/steering message's actions row. */
+function UserRewindAction(props) {
+  const { row, onUndo, label } = props
+  return React.createElement('button', {
+    type: 'button',
+    className: 'su-action',
+    title: label,
+    'aria-label': label,
+    onClick: (event) => { event.stopPropagation(); onUndo(row) },
+  }, React.createElement(UndoIcon))
+}
+
+/** Restore the withdrawn prompt to the composer (facade setDraft, then DOM fallback). */
+function refillComposer(ctx, sessionId, text) {
+  return new Promise((resolve) => {
+    if (!text) { resolve(false); return }
+    let tries = 0
+    let settled = false
+    const finish = (ok) => { if (!settled) { settled = true; resolve(ok) } }
+    const write = () => {
+      const actx = ctx.sessions.scope?.(sessionId)
+      if (actx !== undefined) {
+        try { ctx.uiConversation.input.for(actx).setDraft(text); return true } catch { /* fall through to DOM */ }
+      }
+      const editable = document.querySelector('[data-composer-input]')
+      if (editable === null) return false
+      editable.focus()
+      const selection = document.getSelection()
+      if (selection !== null) {
+        const range = document.createRange()
+        range.selectNodeContents(editable)
+        selection.removeAllRanges()
+        selection.addRange(range)
+      }
+      try { if (document.execCommand('insertText', false, text)) return true } catch { /* fall through */ }
+      editable.textContent = text
+      editable.dispatchEvent(new Event('input', { bubbles: true }))
+      return true
+    }
+    const attempt = () => {
+      if (write()) { setTimeout(() => { write(); finish(true) }, 400); return }
+      if (tries++ < 50) setTimeout(attempt, 100)
+      else finish(false)
+    }
+    attempt()
+  })
 }
 
 function apply(ctx) {
@@ -994,15 +1318,13 @@ function apply(ctx) {
     }
     const undoRequest = createSource(null)
 
-    ctx.slots.inject('conversation.chat.assistant-actions', () => ctx.slots.register({
-      name: 'conversation.chat.assistant-actions',
-      id: 'session-undo',
-      order: 5,
-      locale: UNDO_NS,
-      inject: (sessionId) => ({
-        undo: (messageId) => { undoRequest.set({ sessionId, messageId }) },
-      }),
-    }, UndoAction))
+    // ↶ on each user/steering message row (opencode-style). The row supplies the
+    // target seq and prompt text directly; clicking opens the confirm dialog.
+    ctx.effect(() => installRowAction(ctx.slots, (row) => React.createElement(UserRewindAction, {
+      row,
+      onUndo: (selected) => { undoRequest.set(selected) },
+      label: tu('action.undo'),
+    })), 'session-undo user-row action')
 
     ctx.slots.inject('shell.overlay', () => ctx.slots.register({
       name: 'shell.overlay',
@@ -1015,11 +1337,15 @@ function apply(ctx) {
         confirmUndo: (request) => runUndo(ctx, request),
       }),
     }, UndoDialog))
+
+    // Hide withdrawn transcript rows for executed rewinds (private chat-builder
+    // seam; shape-checked and restored on unload, degrades gracefully).
+    installChatViewVisibility(ctx)
   } catch (error) {
     console.error('session-delete: client apply failed', error)
     showBanner(`session-delete 客户端加载失败：${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
-module.exports = { name: 'session-delete', inject: ['contextMenus', 'slots', 'locale', 'sessions', 'uiWorkspace', 'uiConversation'], apply }
+module.exports = { name: 'session-delete', inject: ['contextMenus', 'slots', 'locale', 'sessions', 'uiWorkspace', 'uiConversation'], apply, __rewindTest: { rewindCutsOf, rewindTargetSeqOfArgs, RewindVisibilityBuilder } }
 return module.exports; } });

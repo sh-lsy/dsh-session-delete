@@ -337,6 +337,33 @@ export function mountUndo(ctx, config) {
   route(SNAPSHOTS_PATH, body => listSnapshots(snapshots, body))
   route(PURGE_PATH, () => purge(ctx, config, snapshots, persist))
   route(CLEAR_QUEUE_PATH, body => clearQueue(ctx, body))
+
+  // The /rewind engine command: the client drives it with `@<seq> <mode>`; the
+  // command node durably records the marker seq (outcome.sourceEventSeq) so the
+  // client can hide the withdrawn transcript span across reloads.
+  const rewindHandler = async (invocation) => {
+    const raw = (invocation.rawInput ?? '').trim()
+    const match = /^@(\d+)(?:\s+(chat|both))?$/.exec(raw)
+    if (match === null) return { kind: 'error', text: 'usage: /rewind @<seq> [chat|both]' }
+    const targetSeq = Number(match[1])
+    const mode = match[2] ?? 'both'
+    const agent = invocation.agent
+    if (agent === undefined) return { kind: 'error', text: 'no active session' }
+    try {
+      const result = await executeRewind(ctx, config, executable, snapshots, agent, targetSeq, mode, invocation.signal)
+      if (result.code !== undefined) return { kind: 'error', text: result.message ?? result.code }
+      return { kind: 'success', text: `Rewound to message @${targetSeq}.`, sourceEventSeq: result.markerSeq }
+    } catch (error) {
+      return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
+    }
+  }
+  ctx.inject(['commands'], (scope) => {
+    scope.effect(() => scope.commands.register({
+      name: 'rewind',
+      description: 'Rewind the conversation to an earlier message',
+      handler: rewindHandler,
+    }), 'session-undo: /rewind command')
+  })
 }
 
 /**
@@ -399,6 +426,115 @@ export function surfaceRewindRange(ctx, sessionId, boundary) {
   if (startIdx < 0) return { code: 'nothing-to-rewind', message: 'no conversation after this point' }
   if (startIdx === 0) return { code: 'no-prior-turn', message: 'cannot rewind before the first message' }
   return { session, startSeq: nodes[startIdx], endSeq: nodes[nodes.length - 1], shadowed: nodes.slice(startIdx) }
+}
+
+/** Locate the surface range to shadow when rewinding to a target user-message seq. */
+export function surfaceRangeBySeq(session, targetSeq) {
+  const nodes = session.surface.nodes
+  const startIdx = nodes.indexOf(targetSeq)
+  if (startIdx < 0) return { code: 'not-on-surface', message: 'the target is no longer in the model context (shadowed by compaction)' }
+  if (startIdx === 0) return { code: 'no-prior-turn', message: 'cannot rewind before the first message' }
+  return { startSeq: nodes[startIdx], endSeq: nodes[nodes.length - 1], shadowed: nodes.slice(startIdx) }
+}
+
+/** The turn number containing a log seq, from turn/start boundaries. */
+export function turnOfSeq(events, seq) {
+  let turn
+  for (const event of events) {
+    if (event.seq > seq) break
+    if (event.type === 'turn/start') turn = event.data?.turn
+  }
+  return turn
+}
+
+/** Wait for an agent to reach idle via its activity promise, bounded by a deadline. */
+async function waitForAgentIdle(agent, signal, timeoutMs = 15000) {
+  if (signal?.aborted) return false
+  let timer
+  let onAbort
+  try {
+    await Promise.race([
+      agent.whenIdle(),
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('idle wait timed out')), timeoutMs)
+        onAbort = () => reject(new Error('idle wait aborted'))
+        signal?.addEventListener('abort', onAbort, { once: true })
+      }),
+    ])
+    return true
+  } catch {
+    return false
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    if (onAbort !== undefined) signal?.removeEventListener('abort', onAbort)
+  }
+}
+
+/**
+ * Execute an in-place rewind to a target user-message seq (the /rewind engine).
+ *
+ * Stops a running turn, reverts the target turn's own file changes (mode 'both',
+ * conflict-aware), then appends a surface-replace marker that cuts the model
+ * context from the target onward — same session, append-only log. The returned
+ * marker seq goes into the command result so the client can derive the hidden
+ * transcript span from the durable command node.
+ * @returns the marker seq + prompt + file report, or a refusal code.
+ */
+export async function executeRewind(ctx, config, executable, snapshots, agent, targetSeq, mode, signal) {
+  const session = agent.session
+  const sessionId = session.id
+  if (session.header.origin === 'subagent' || (session.header.delegationDepth ?? 0) > 0) {
+    return { code: 'subagent', message: 'cannot rewind a subagent session' }
+  }
+  if (agent.status !== 'idle') {
+    agent.cancel({ kind: 'user' }, { keepInbox: true })
+    const stopped = await waitForAgentIdle(agent, signal)
+    if (!stopped) return { code: 'session-busy', message: 'the session is running and could not be stopped' }
+  }
+  const events = session.snapshotEvents()
+  const targetEvent = events.find(event => event.seq === targetSeq)
+  if (targetEvent === undefined || targetEvent.type !== 'user/message' || targetEvent.data?.source?.kind !== 'user') {
+    return { code: 'not-a-user-message', message: 'the target is not a user message' }
+  }
+  const range = surfaceRangeBySeq(session, targetSeq)
+  if (range.code !== undefined) return range
+  const turn = turnOfSeq(events, targetSeq)
+  const prompt = textOf(targetEvent.data.content)
+
+  let reverted = []
+  let conflicts = []
+  let fileSnapshot = false
+  if (mode === 'both' && turn !== undefined) {
+    const snapshot = snapshots.get(`${sessionId}#${turn}`)
+    if (snapshot?.startTree != null && snapshot?.endTree != null) {
+      const exe = await executable()
+      if (exe !== null) {
+        const workSignal = signal ?? new AbortController().signal
+        const workspace = await locateWorkspace(ctx, config, exe, snapshot.cwd, workSignal)
+        if (workspace !== null) {
+          const result = await revertTurn(ctx, config, exe, workspace, snapshot.startTree, snapshot.endTree, workSignal)
+          reverted = result.reverted
+          conflicts = result.conflicts
+          fileSnapshot = true
+        }
+      }
+    }
+  }
+
+  // Non-empty placeholder content: a strict OpenAI-compatible gateway rejects an
+  // empty user message, and the marker stays in the model surface tail.
+  const marker = deepFreeze({
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text: '(empty message)' }],
+    source: { kind: 'user' },
+  })
+  const markerEvent = session.append('user/message', marker, {
+    surfaceOp: { op: 'replace', startSeq: range.startSeq, endSeq: range.endSeq },
+    sourceEventSeqs: range.shadowed,
+  })
+  ctx.logger.info('session-undo: rewound %s to seq %d (turn %s, %d files reverted, %d conflicts)', sessionId, targetSeq, turn, reverted.length, conflicts.length)
+  return { markerSeq: markerEvent.seq, prompt, turn, reverted, conflicts, fileSnapshot }
 }
 
 /**

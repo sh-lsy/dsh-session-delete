@@ -14,7 +14,7 @@ import test from 'node:test'
 import { promisify } from 'node:util'
 
 import {
-  clearQueue, locateWorkspace, resolveRewind, resolveUndoConfig, revertTurn, snapshotTree, surfaceRewindRange, textOf,
+  clearQueue, executeRewind, locateWorkspace, resolveRewind, resolveUndoConfig, revertTurn, snapshotTree, surfaceRangeBySeq, surfaceRewindRange, textOf, turnOfSeq,
 } from '../undo-host.js'
 
 const execFileAsync = promisify(execFile)
@@ -203,4 +203,66 @@ test('surfaceRewindRange locates the tail range and protects the first node', ()
   assert.equal(surfaceRewindRange(ctx, 'live', 9).code, 'nothing-to-rewind')
   // cold session -> not live.
   assert.equal(surfaceRewindRange(ctx, 'cold', 3).code, 'not-live')
+})
+
+test('surfaceRangeBySeq shadows from the target node and guards the edges', () => {
+  const session = { surface: { nodes: [1, 2, 5, 6] } }
+  const range = surfaceRangeBySeq(session, 5)
+  assert.equal(range.startSeq, 5)
+  assert.equal(range.endSeq, 6)
+  assert.deepEqual(range.shadowed, [5, 6])
+  assert.equal(surfaceRangeBySeq(session, 1).code, 'no-prior-turn')
+  assert.equal(surfaceRangeBySeq(session, 99).code, 'not-on-surface')
+})
+
+test('turnOfSeq finds the turn containing a seq', () => {
+  const events = [
+    { seq: 0, type: 'turn/start', data: { turn: 1 } },
+    { seq: 3, type: 'turn/end', data: { turn: 1 } },
+    { seq: 4, type: 'turn/start', data: { turn: 2 } },
+    { seq: 7, type: 'turn/end', data: { turn: 2 } },
+  ]
+  assert.equal(turnOfSeq(events, 1), 1)
+  assert.equal(turnOfSeq(events, 5), 2)
+  assert.equal(turnOfSeq(events, 0), 1)
+})
+
+test('executeRewind appends a surface-replace marker and returns its seq + prompt', async () => {
+  const events = [
+    { seq: 0, type: 'turn/start', data: { turn: 1 } },
+    { seq: 1, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'p1' }] } },
+    { seq: 2, type: 'assistant/message', data: { turn: 1, message: { id: 'a1' } } },
+    { seq: 3, type: 'turn/end', data: { turn: 1 } },
+    { seq: 4, type: 'turn/start', data: { turn: 2 } },
+    { seq: 5, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'p2' }] } },
+    { seq: 6, type: 'assistant/message', data: { turn: 2, message: { id: 'a2' } } },
+    { seq: 7, type: 'turn/end', data: { turn: 2 } },
+  ]
+  const appended = []
+  const session = {
+    id: 's1', header: {}, snapshotEvents: () => events, surface: { nodes: [1, 2, 5, 6] },
+    append: (type, data, opts) => { appended.push({ type, data, opts }); return { seq: 8 } },
+  }
+  const agent = { session, status: 'idle', whenIdle: async () => {}, cancel: () => {} }
+  const ctx = { logger: { info() {}, warn() {} }, get: () => undefined }
+  const result = await executeRewind(ctx, resolveUndoConfig({}), async () => null, new Map(), agent, 5, 'chat', undefined)
+  assert.equal(result.markerSeq, 8)
+  assert.equal(result.prompt, 'p2')
+  assert.equal(result.turn, 2)
+  assert.equal(appended.length, 1)
+  assert.deepEqual(appended[0].opts.surfaceOp, { op: 'replace', startSeq: 5, endSeq: 6 })
+  assert.deepEqual(appended[0].opts.sourceEventSeqs, [5, 6])
+  assert.equal(appended[0].data.content[0].text, '(empty message)')
+})
+
+test('executeRewind refuses a non-user target and a subagent session', async () => {
+  const events = [{ seq: 1, type: 'assistant/message', data: { turn: 1, message: { id: 'a1' } } }]
+  const session = { id: 's1', header: {}, snapshotEvents: () => events, surface: { nodes: [1] }, append: () => ({ seq: 2 }) }
+  const agent = { session, status: 'idle', whenIdle: async () => {}, cancel: () => {} }
+  const ctx = { logger: { info() {}, warn() {} }, get: () => undefined }
+  const notUser = await executeRewind(ctx, resolveUndoConfig({}), async () => null, new Map(), agent, 1, 'chat', undefined)
+  assert.equal(notUser.code, 'not-a-user-message')
+  const child = { session: { ...session, header: { origin: 'subagent' } }, status: 'idle' }
+  const sub = await executeRewind(ctx, resolveUndoConfig({}), async () => null, new Map(), child, 1, 'chat', undefined)
+  assert.equal(sub.code, 'subagent')
 })
