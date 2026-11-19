@@ -177,11 +177,23 @@ Both require `peer.principal.kind === 'owner'`. The Web half (`client.js`) is a 
 ## Development
 
 ```sh
-node tests/host.test.mjs      # delete / batch (13 tests)
-node tests/undo.test.mjs      # undo, incl. real git and non-git restore safety (7 tests)
+node tests/host.test.mjs      # delete / batch + route/command registration (13 tests)
+node tests/undo.test.mjs      # rewind planning, real git/non-git conflict-aware restore (15 tests)
+node tests/client.test.mjs    # chat-visibility cut derivation + hiding (4 tests)
 ```
 
 `node --test tests/` spawns a child process per file, which some sandboxes block; running the file directly keeps the run in-process.
+
+## Credits
+
+The session delete / batch cleanup / reference-counted attachment GC and the
+git-shadow-snapshot conflict-aware file restore are original to this plugin.
+
+The in-place conversation-rewind mechanism is adapted from
+[`SiriLee/dsh-rewind`](https://github.com/SiriLee/dsh-rewind) (MIT): the
+chat-snapshot visibility wrapper, the user/steering row action mount, the
+`/rewind` popupSelect command decoration, and the surface-replace marker
+approach follow its design and code. Used under the MIT license with attribution.
 
 ## License
 

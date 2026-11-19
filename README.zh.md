@@ -126,9 +126,16 @@ dsh plugin install <本目录的绝对路径>
 ## 开发
 
 ```sh
-node tests/host.test.mjs   # 删除/批量（13 项）
-node tests/undo.test.mjs   # 撤销，含真实 git 与非 git 还原安全测试（7 项）
+node tests/host.test.mjs   # 删除/批量 + 路由/命令注册（13 项）
+node tests/undo.test.mjs   # 回退规划、真实 git/非 git 冲突感知还原（15 项）
+node tests/client.test.mjs # chat 可见性区间推导 + 隐藏（4 项）
 ```
+
+## 致谢
+
+会话删除 / 批量清理 / 引用计数附件 GC，以及 git 影子快照冲突感知文件还原，为本插件原创。
+
+原地对话回退机制改编自 [`SiriLee/dsh-rewind`](https://github.com/SiriLee/dsh-rewind)（MIT）：chat 快照可见性包装、用户/steering 行操作挂载、`/rewind` popupSelect 命令装饰、表面替换标记思路，均遵循其设计与代码。依 MIT 许可使用并署名。
 
 ## 许可
 
