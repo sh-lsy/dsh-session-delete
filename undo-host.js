@@ -23,6 +23,7 @@ const PREPARE_PATH = '/session-undo/prepare'
 const SNAPSHOTS_PATH = '/session-undo/snapshots'
 const PURGE_PATH = '/session-undo/purge'
 const CLEAR_QUEUE_PATH = '/session-undo/clear-queue'
+const PREVIEW_PATH = '/session-undo/preview'
 const DAY_MS = 86_400_000
 const STDERR_TAIL_BYTES = 16 * 1024
 const TERMINATE_GRACE_MS = 2_000
@@ -202,6 +203,27 @@ export async function revertTurn(ctx, config, executable, workspace, startTree, 
   return { reverted, conflicts }
 }
 
+/**
+ * Dry-run file impact of rewinding one turn: the files it changed, the revert
+ * action (restore content / remove a turn-added file), and whether each is a
+ * conflict (modified after the turn, so it would be skipped). Touches nothing.
+ * @returns one {path, action, conflict} entry per changed file.
+ */
+export async function previewTurn(ctx, config, executable, workspace, startTree, endTree, signal) {
+  const diff = await runGit(ctx, config, executable, ['diff', '--name-only', '-z', startTree, endTree], { cwd: workspace.root, env: workspace.env, signal })
+  if (diff.exitCode !== 0) throw new Error(`git diff failed: ${diff.stderr.trim()}`)
+  const paths = diff.stdout.split('\0').filter(Boolean)
+  const files = []
+  for (const path of paths) {
+    const endOid = await treeBlobOid(ctx, config, executable, workspace, endTree, path, signal)
+    const startOid = await treeBlobOid(ctx, config, executable, workspace, startTree, path, signal)
+    const curOid = await currentOid(ctx, config, executable, workspace, path, signal)
+    const unchangedSinceTurn = endOid !== null ? curOid === endOid : curOid === null
+    files.push({ path, action: startOid !== null ? 'restore' : 'remove', conflict: !unchangedSinceTurn })
+  }
+  return files
+}
+
 /** Join the text blocks of a message content array. */
 export function textOf(content) {
   if (!Array.isArray(content)) return ''
@@ -337,6 +359,7 @@ export function mountUndo(ctx, config) {
   route(SNAPSHOTS_PATH, body => listSnapshots(snapshots, body))
   route(PURGE_PATH, () => purge(ctx, config, snapshots, persist))
   route(CLEAR_QUEUE_PATH, body => clearQueue(ctx, body))
+  route(PREVIEW_PATH, body => previewRewind(ctx, config, executable, snapshots, body))
 
   // The /rewind engine command: the client drives it with `@<seq> <mode>`; the
   // command node durably records the marker seq (outcome.sourceEventSeq) so the
@@ -535,6 +558,40 @@ export async function executeRewind(ctx, config, executable, snapshots, agent, t
   })
   ctx.logger.info('session-undo: rewound %s to seq %d (turn %s, %d files reverted, %d conflicts)', sessionId, targetSeq, turn, reverted.length, conflicts.length)
   return { markerSeq: markerEvent.seq, prompt, turn, reverted, conflicts, fileSnapshot }
+}
+
+/**
+ * Preview the file impact of rewinding to a target seq (mode 'both' confirmation).
+ * Resolves the target's turn, reads its snapshot, and dry-runs the conflict-aware
+ * diff. Returns no files when there is no snapshot (conversation-only fallback).
+ * @param body - `{ sessionId, seq }`.
+ * @returns `{ fileSnapshot, files: [{path, action, conflict}] }`.
+ */
+export async function previewRewind(ctx, config, executable, snapshots, body) {
+  const sessionId = body.sessionId
+  const seq = body.seq
+  if (typeof sessionId !== 'string' || !Number.isSafeInteger(seq)) {
+    return { ok: false, code: 'bad-request', message: 'sessionId and an integer seq are required' }
+  }
+  const live = ctx.get('sessions')?.get(sessionId)
+  let events
+  if (live !== undefined) {
+    events = live.snapshotEvents()
+  } else {
+    const observed = await ctx.sessionQuery.observeSession(sessionId)
+    try { events = observed.events } finally { observed[Symbol.dispose]?.() }
+  }
+  const turn = turnOfSeq(events, seq)
+  const empty = { ok: true, data: { fileSnapshot: false, files: [] } }
+  if (turn === undefined) return empty
+  const snapshot = snapshots.get(`${sessionId}#${turn}`)
+  if (snapshot?.startTree == null || snapshot?.endTree == null) return empty
+  const exe = await executable()
+  if (exe === null) return empty
+  const workspace = await locateWorkspace(ctx, config, exe, snapshot.cwd, new AbortController().signal)
+  if (workspace === null) return empty
+  const files = await previewTurn(ctx, config, exe, workspace, snapshot.startTree, snapshot.endTree, new AbortController().signal)
+  return { ok: true, data: { fileSnapshot: true, files } }
 }
 
 /**

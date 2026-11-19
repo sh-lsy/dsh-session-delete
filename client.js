@@ -292,6 +292,16 @@ const SESSION_DELETE_CSS = `
 .su-btn-cancel { min-width: 72px; }
 .su-btn-confirm { min-width: 136px; }
 .su-delete:not(:disabled) { color: var(--dsw-alias-state-error-primary); }
+.su-modes { display: flex; flex-direction: column; gap: 8px; }
+.su-mode.su-mode { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; height: auto; padding: 10px 12px; text-align: left; }
+.su-mode-title { font-size: 13px; line-height: 20px; font-weight: 500; color: var(--dsw-alias-label-primary); }
+.su-mode-hint { font-size: 12px; line-height: 18px; font-weight: 400; color: var(--dsw-alias-label-caption); }
+.su-files { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; max-height: min(280px, 40vh); overflow-y: auto; }
+.su-file { display: flex; align-items: center; gap: 8px; font-size: 12px; line-height: 18px; }
+.su-file-action { flex: none; min-width: 36px; color: var(--dsw-alias-label-caption); }
+.su-file-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dsw-alias-label-secondary); font-family: var(--dsh-font-mono, monospace); }
+.su-file-conflict .su-file-action { color: var(--dsw-alias-state-warning-primary, var(--dsw-alias-state-error-primary)); }
+.su-file-conflict .su-file-path { text-decoration: line-through; opacity: 0.7; }
 `
 
 /** Install the stylesheet once, directly into the document head. */
@@ -742,6 +752,16 @@ const UNDO_DICT = {
     'dialog.warning': '将在当前会话原地回退到这条消息之前：撤回这条消息及之后的对话，还原其间改过的文件（之后被改过的跳过、不动），并把这条消息的提示词放回输入框；不影响你最新的其他改动',
     'dialog.cancel': '取消',
     'dialog.confirm': '回退',
+    'dialog.modeChat': '仅回退对话',
+    'dialog.modeChatHint': '撤回这条消息及之后的对话，不改动文件',
+    'dialog.modeBoth': '回退对话和文件',
+    'dialog.modeBothHint': '撤回对话，并还原其间改过的文件',
+    'dialog.filesTitle': '将还原以下文件（之后被改过的会跳过）',
+    'dialog.filesEmpty': '没有该轮的文件快照，将仅回退对话',
+    'dialog.loading': '正在加载文件清单…',
+    'dialog.fileRestore': '还原',
+    'dialog.fileRemove': '删除',
+    'dialog.fileConflict': '跳过',
     'dialog.working': '正在回退…',
     'dialog.done': '完成',
     'dialog.doneTitle': '已回退',
@@ -763,6 +783,16 @@ const UNDO_DICT = {
     'dialog.warning': 'Rewinds in place in the current session to before this message: withdraws this message and everything after it, reverts the files changed in between (later-modified files are skipped, untouched), and restores this message\'s prompt to the composer; your other latest changes are not affected',
     'dialog.cancel': 'Cancel',
     'dialog.confirm': 'Rewind',
+    'dialog.modeChat': 'Conversation only',
+    'dialog.modeChatHint': 'Withdraw this message and everything after it; leave files unchanged',
+    'dialog.modeBoth': 'Conversation and files',
+    'dialog.modeBothHint': 'Withdraw the conversation and revert the files changed in between',
+    'dialog.filesTitle': 'These files will be reverted (later-modified ones are skipped)',
+    'dialog.filesEmpty': 'No file snapshot for this turn; only the conversation will be rewound',
+    'dialog.loading': 'Loading file list…',
+    'dialog.fileRestore': 'restore',
+    'dialog.fileRemove': 'remove',
+    'dialog.fileConflict': 'skip',
     'dialog.working': 'Rewinding…',
     'dialog.done': 'Done',
     'dialog.doneTitle': 'Rewound',
@@ -793,13 +823,13 @@ function UndoIcon() {
 /** Run the undo in place via the /rewind engine command, then refill the composer
  * with the withdrawn prompt. Same session, no fork (opencode-style). The request
  * is a user-message row {sessionId, seq, text}: seq is the target, text the prompt. */
-async function runUndo(ctx, request) {
+async function runUndo(ctx, request, mode) {
   const { sessionId, seq, text } = request
   const face = ctx.sessions.binding(sessionId)?.session
   if (face === undefined) return { ok: false, code: 'not-live', message: '会话不可用' }
   let result
   try {
-    result = await face.command(`/rewind @${seq} both`)
+    result = await face.command(`/rewind @${seq} ${mode === 'chat' ? 'chat' : 'both'}`)
   } catch (error) {
     return { ok: false, code: 'command-failed', message: error instanceof Error ? error.message : String(error) }
   }
@@ -813,40 +843,75 @@ async function runUndo(ctx, request) {
 /** The undo confirmation dialog hosted in shell.overlay. */
 function UndoDialog(props) {
   const request = typeof props.useUndoRequest === 'function' ? props.useUndoRequest(state => state) : null
-  const [phase, setPhase] = React.useState({ kind: 'idle' })
+  const [phase, setPhase] = React.useState({ kind: 'select' })
   React.useEffect(() => {
-    if (request === null) setPhase({ kind: 'idle' })
+    if (request === null) setPhase({ kind: 'select' })
   }, [request])
   const t2 = (key) => (typeof props.translate === 'function' ? props.translate(key) : key)
   const close = () => {
-    if (phase.kind === 'working') return
+    if (phase.kind === 'working' || phase.kind === 'loading') return
     props.dismiss()
   }
-  const confirm = async () => {
+  const execute = async (mode) => {
     if (request === null || phase.kind === 'working') return
     setPhase({ kind: 'working' })
-    const result = await props.confirmUndo(request)
+    const result = await props.confirmUndo(request, mode)
     setPhase(result?.ok === true
       ? { kind: 'done', prefillOk: result.prefillOk === true }
       : { kind: 'error', code: result?.code, message: result?.message })
   }
+  const chooseFiles = async () => {
+    if (request === null) return
+    setPhase({ kind: 'loading' })
+    let preview
+    try { preview = await post('/session-undo/preview', { sessionId: request.sessionId, seq: request.seq }) } catch { preview = null }
+    const ok = preview?.ok === true
+    setPhase({ kind: 'files', files: ok ? preview.data.files : [], fileSnapshot: ok && preview.data.fileSnapshot === true })
+  }
+
   const footer = (() => {
-    if (phase.kind === 'done') return React.createElement(Button, { variant: 'primary', className: 'su-btn-confirm', onClick: close }, t2('dialog.done'))
-    return [
-      React.createElement(Button, { key: 'cancel', variant: 'outline', className: 'su-btn-cancel', disabled: phase.kind === 'working', onClick: close }, t2('dialog.cancel')),
-      React.createElement(Button, { key: 'confirm', variant: 'outline', className: 'su-delete su-btn-confirm', disabled: phase.kind === 'working', onClick: () => { void confirm() } },
-        phase.kind === 'working' ? t2('dialog.working') : t2('dialog.confirm')),
-    ]
+    if (phase.kind === 'done') {
+      return React.createElement(Button, { variant: 'primary', className: 'su-btn-confirm', onClick: close }, t2('dialog.done'))
+    }
+    const busy = phase.kind === 'working' || phase.kind === 'loading'
+    const cancel = React.createElement(Button, { key: 'cancel', variant: 'outline', className: 'su-btn-cancel', disabled: busy, onClick: close }, t2('dialog.cancel'))
+    if (phase.kind === 'files') {
+      return [cancel, React.createElement(Button, { key: 'confirm', variant: 'outline', className: 'su-delete su-btn-confirm', onClick: () => { void execute('both') } }, t2('dialog.confirm'))]
+    }
+    return [cancel]
   })()
+
   const children = []
   if (phase.kind === 'done') {
     children.push(React.createElement('div', { key: 'done-title', className: 'su-text', style: { fontWeight: 500, color: 'var(--dsw-alias-label-primary)' } }, t2('dialog.doneTitle')))
     children.push(React.createElement('div', { key: 'done-desc', className: 'su-text' }, t2('dialog.doneDesc')))
-    if (!phase.prefillOk) {
-      children.push(React.createElement('div', { key: 'done-prefill', className: 'su-error' }, t2('dialog.prefillFailed')))
+    if (!phase.prefillOk) children.push(React.createElement('div', { key: 'done-prefill', className: 'su-error' }, t2('dialog.prefillFailed')))
+  } else if (phase.kind === 'select') {
+    children.push(React.createElement('div', { key: 'warning', className: 'su-notice' }, t2('dialog.warning')))
+    children.push(React.createElement('div', { key: 'modes', className: 'su-modes' },
+      React.createElement(Button, { variant: 'outline', className: 'su-mode', onClick: () => { void execute('chat') } },
+        React.createElement('span', { className: 'su-mode-title' }, t2('dialog.modeChat')),
+        React.createElement('span', { className: 'su-mode-hint' }, t2('dialog.modeChatHint'))),
+      React.createElement(Button, { variant: 'outline', className: 'su-mode', onClick: () => { void chooseFiles() } },
+        React.createElement('span', { className: 'su-mode-title' }, t2('dialog.modeBoth')),
+        React.createElement('span', { className: 'su-mode-hint' }, t2('dialog.modeBothHint')))))
+  } else if (phase.kind === 'files') {
+    if (!phase.fileSnapshot || phase.files.length === 0) {
+      children.push(React.createElement('div', { key: 'files-empty', className: 'su-notice' }, t2('dialog.filesEmpty')))
+    } else {
+      children.push(React.createElement('div', { key: 'files-title', className: 'su-text', style: { fontWeight: 500 } }, t2('dialog.filesTitle')))
+      children.push(React.createElement('div', { key: 'files-list', className: 'su-files' },
+        phase.files.map((file, index) => React.createElement('div', { key: index, className: `su-file${file.conflict ? ' su-file-conflict' : ''}` },
+          React.createElement('span', { className: 'su-file-action' }, file.conflict ? t2('dialog.fileConflict') : (file.action === 'remove' ? t2('dialog.fileRemove') : t2('dialog.fileRestore'))),
+          React.createElement('span', { className: 'su-file-path', title: file.path }, file.path)))))
     }
+  } else if (phase.kind === 'loading') {
+    children.push(React.createElement('div', { key: 'loading', className: 'su-text' }, t2('dialog.loading')))
   } else {
     children.push(React.createElement('div', { key: 'warning', className: 'su-notice' }, t2('dialog.warning')))
+    if (phase.kind === 'working') {
+      children.push(React.createElement('div', { key: 'working', className: 'su-text' }, t2('dialog.working')))
+    }
     if (phase.kind === 'error') {
       const reasonKey = phase.code === undefined ? undefined : `reason.${String(phase.code)}`
       const localized = reasonKey === undefined ? undefined : t2(reasonKey)
@@ -1334,7 +1399,7 @@ function apply(ctx) {
         hooks: { undoRequest },
         dismiss: () => { undoRequest.set(null) },
         translate: tu,
-        confirmUndo: (request) => runUndo(ctx, request),
+        confirmUndo: (request, mode) => runUndo(ctx, request, mode),
       }),
     }, UndoDialog))
 

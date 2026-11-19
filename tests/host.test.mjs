@@ -120,6 +120,7 @@ test('apply registers the delete and undo owner-only POST routes', () => {
     '/session-delete/inspect',
     '/session-undo/clear-queue',
     '/session-undo/prepare',
+    '/session-undo/preview',
     '/session-undo/purge',
     '/session-undo/snapshots',
   ])

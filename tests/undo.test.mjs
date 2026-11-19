@@ -14,7 +14,7 @@ import test from 'node:test'
 import { promisify } from 'node:util'
 
 import {
-  clearQueue, executeRewind, locateWorkspace, resolveRewind, resolveUndoConfig, revertTurn, snapshotTree, surfaceRangeBySeq, surfaceRewindRange, textOf, turnOfSeq,
+  clearQueue, executeRewind, locateWorkspace, previewTurn, resolveRewind, resolveUndoConfig, revertTurn, snapshotTree, surfaceRangeBySeq, surfaceRewindRange, textOf, turnOfSeq,
 } from '../undo-host.js'
 
 const execFileAsync = promisify(execFile)
@@ -265,4 +265,30 @@ test('executeRewind refuses a non-user target and a subagent session', async () 
   const child = { session: { ...session, header: { origin: 'subagent' } }, status: 'idle' }
   const sub = await executeRewind(ctx, resolveUndoConfig({}), async () => null, new Map(), child, 1, 'chat', undefined)
   assert.equal(sub.code, 'subagent')
+})
+
+test('previewTurn lists the turn file impact with actions and conflicts (dry-run)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-undo-'))
+  const data = await mkdtemp(join(tmpdir(), 'dsh-undo-data-'))
+  try {
+    await writeFile(join(dir, 'a.txt'), 'baseline')
+    const { ctx, config, workspace, signal, snap } = await harness(dir, data)
+    const start = await snap()
+    await writeFile(join(dir, 'a.txt'), 'turn-edit')
+    await writeFile(join(dir, 'b.txt'), 'new')
+    const end = await snap()
+    await writeFile(join(dir, 'a.txt'), 'later-edit') // superseded -> conflict
+    const files = await previewTurn(ctx, config, 'git', workspace, start, end, signal)
+    const byPath = Object.fromEntries(files.map(file => [file.path, file]))
+    assert.equal(byPath['a.txt'].action, 'restore')
+    assert.equal(byPath['a.txt'].conflict, true)
+    assert.equal(byPath['b.txt'].action, 'remove')
+    assert.equal(byPath['b.txt'].conflict, false)
+    // dry-run: nothing on disk changed
+    assert.equal(await readFile(join(dir, 'a.txt'), 'utf8'), 'later-edit')
+    assert.equal(await readFile(join(dir, 'b.txt'), 'utf8'), 'new')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    await rm(data, { recursive: true, force: true })
+  }
 })
