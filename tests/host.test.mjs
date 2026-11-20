@@ -47,7 +47,10 @@ function makeContext(options = {}) {
       list: options.list ?? (async () => []),
       open: async (id) => ({
         id,
-        read: async () => ({ events: options.logs?.[id] ?? [] }),
+        read: async () => {
+          if (options.failRead?.includes(id)) throw new Error('unreadable session')
+          return { events: options.logs?.[id] ?? [] }
+        },
         close: async () => {},
       }),
     },
@@ -373,6 +376,45 @@ test('batchDelete deep cleanup reclaims exclusive attachments and keeps shared o
     assert.equal(existsSync(join(attachRoot, 'objects', hexC.slice(0, 2), hexC)), true)
     assert.equal(result.data.attachments.removed, 2)
     assert.equal(result.data.attachments.kept, 1)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('batchDelete deep cleanup fails closed when a remaining session is unreadable', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-sd-'))
+  try {
+    const hexA = 'a'.repeat(64)
+    const hexC = 'c'.repeat(64)
+    const s1 = SESSION
+    const s3 = 'session-33333333-2222-3333-4444-555555555555'
+    const dirs = { [s1]: await sessionDir(root, s1), [s3]: await sessionDir(root, s3) }
+    const logs = {
+      [s1]: [{ attachment: { attachmentId: `sha256:${hexA}` } }, { attachment: { attachmentId: `sha256:${hexC}` } }],
+      [s3]: [{ attachment: { attachmentId: `sha256:${hexC}` } }],
+    }
+    const attachRoot = join(root, 'attachments', 'v1')
+    for (const hex of [hexA, hexC]) {
+      await mkdir(join(attachRoot, 'objects', hex.slice(0, 2)), { recursive: true })
+      await writeFile(join(attachRoot, 'objects', hex.slice(0, 2), hex), 'bytes')
+    }
+    const workspace = { id: 'w1', path: '/tmp/demo', sessionIds: [s1, s3], async detachSession() {} }
+    const ctx = makeContext({
+      workspaces: [workspace],
+      logs,
+      failRead: [s3], // the remaining session cannot be read -> its refs are unknown
+      stat: async (id) => snapFor(dirs[id].log, id),
+      list: async () => [s1, s3].map(id => snapFor(dirs[id].log, id)).filter(s => existsSync(s.location.path)),
+      services: { attachments: { root: attachRoot } },
+    })
+    const result = await batchDelete(ctx, resolveConfig(undefined), { sessionIds: [s1], deepAttachments: true })
+    assert.equal(result.ok, true)
+    // GC skipped: even the exclusive hexA is preserved because s3's refs are unknown.
+    assert.equal(result.data.attachments.skipped, true)
+    assert.equal(result.data.attachments.removed, 0)
+    assert.equal(existsSync(join(attachRoot, 'objects', hexA.slice(0, 2), hexA)), true)
+    assert.equal(existsSync(join(attachRoot, 'objects', hexC.slice(0, 2), hexC)), true)
+    assert.ok(result.data.warnings.some(w => w.includes('skipped')))
   } finally {
     await rm(root, { recursive: true, force: true })
   }

@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict'
 import { spawn, execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -310,4 +310,37 @@ test('listCandidates lists surface user messages newest first, excluding markers
   assert.deepEqual(result.data.candidates.map(candidate => candidate.seq), [5, 1])
   assert.equal(result.data.candidates[0].text, 'second prompt')
   assert.equal(listCandidates(ctx, { sessionId: 'cold' }).data.candidates.length, 0)
+})
+
+test('revertTurn/previewTurn skip a nested git repo (gitlink) as a conflict, no directory rm', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-undo-'))
+  const data = await mkdtemp(join(tmpdir(), 'dsh-undo-data-'))
+  try {
+    await writeFile(join(dir, 'a.txt'), 'baseline')
+    const nested = join(dir, 'nested')
+    await mkdir(nested, { recursive: true })
+    await git(nested, ['init', '-q'])
+    await git(nested, ['config', 'user.email', 't@t'])
+    await git(nested, ['config', 'user.name', 't'])
+    await writeFile(join(nested, 'n.txt'), 'v1')
+    await git(nested, ['add', '-A'])
+    await git(nested, ['commit', '-qm', 'v1'])
+    const { ctx, config, workspace, signal, snap } = await harness(dir, data)
+    const start = await snap()
+    await writeFile(join(dir, 'a.txt'), 'turn-edit')
+    await writeFile(join(nested, 'n.txt'), 'v2')
+    await git(nested, ['add', '-A'])
+    await git(nested, ['commit', '-qm', 'v2'])
+    const end = await snap()
+    const result = await revertTurn(ctx, config, 'git', workspace, start, end, signal)
+    assert.equal(await readFile(join(dir, 'a.txt'), 'utf8'), 'baseline')
+    assert.ok(result.conflicts.includes('nested'))
+    assert.equal(existsSync(nested), true)
+    assert.equal(await readFile(join(nested, 'n.txt'), 'utf8'), 'v2')
+    const preview = await previewTurn(ctx, config, 'git', workspace, start, end, signal)
+    assert.equal(preview.find(file => file.path === 'nested').conflict, true)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    await rm(data, { recursive: true, force: true })
+  }
 })

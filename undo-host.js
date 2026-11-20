@@ -147,12 +147,12 @@ export async function snapshotTree(ctx, config, executable, workspace, signal) {
   }
 }
 
-/** Blob oid a tree holds at a path, or null when absent or not a blob. */
-async function treeBlobOid(ctx, config, executable, workspace, tree, path, signal) {
+/** A tree entry at a path: {type:'blob'|'commit'|'tree', oid}, or null when absent. */
+async function treeEntry(ctx, config, executable, workspace, tree, path, signal) {
   const result = await runGit(ctx, config, executable, ['ls-tree', tree, '--', path], { cwd: workspace.root, env: workspace.env, signal })
   if (result.exitCode !== 0) return null
-  const match = /^\d+ blob ([0-9a-f]+)\t/.exec(result.stdout.split('\n')[0] ?? '')
-  return match ? match[1] : null
+  const match = /^\d+ (blob|commit|tree) ([0-9a-f]+)\t/.exec(result.stdout.split('\n')[0] ?? '')
+  return match ? { type: match[1], oid: match[2] } : null
 }
 
 /** Current work-tree blob oid of a path, or null when the file is absent. */
@@ -163,33 +163,54 @@ async function currentOid(ctx, config, executable, workspace, path, signal) {
 }
 
 /**
- * Conflict-aware revert of one turn's own file changes.
- *
- * Only files the turn changed (diff start→end) are considered, and each is
- * reverted only when its current content still equals the turn's end state.
- * A file modified after the turn is skipped and reported as a conflict; a file
- * the turn never touched is never modified. The latest code is therefore
- * preserved even when undoing an old turn.
- * @returns reverted paths and skipped conflict paths.
+ * Classify the turn's changed paths into a revert plan and conflicts, writing
+ * nothing. A non-blob tree entry (gitlink/submodule `commit`, nested `tree`) is a
+ * conflict — it cannot be safely restored/removed file-by-file (a directory rm
+ * would throw EISDIR). A file modified after the turn is also a conflict.
+ * @returns {plan: [{path, startOid}], conflicts: [path]}.
  */
-export async function revertTurn(ctx, config, executable, workspace, startTree, endTree, signal) {
+async function classifyTurn(ctx, config, executable, workspace, startTree, endTree, signal) {
   const diff = await runGit(ctx, config, executable, ['diff', '--name-only', '-z', startTree, endTree], { cwd: workspace.root, env: workspace.env, signal })
   if (diff.exitCode !== 0) throw new Error(`git diff failed: ${diff.stderr.trim()}`)
   const paths = diff.stdout.split('\0').filter(Boolean)
+  const plan = []
+  const conflicts = []
+  for (const path of paths) {
+    const endEntry = await treeEntry(ctx, config, executable, workspace, endTree, path, signal)
+    const startEntry = await treeEntry(ctx, config, executable, workspace, startTree, path, signal)
+    if ((endEntry !== null && endEntry.type !== 'blob') || (startEntry !== null && startEntry.type !== 'blob')) {
+      conflicts.push(path)
+      continue
+    }
+    const endOid = endEntry?.oid ?? null
+    const startOid = startEntry?.oid ?? null
+    const curOid = await currentOid(ctx, config, executable, workspace, path, signal)
+    const unchangedSinceTurn = endOid !== null ? curOid === endOid : curOid === null
+    if (!unchangedSinceTurn) {
+      conflicts.push(path)
+      continue
+    }
+    plan.push({ path, startOid })
+  }
+  return { plan, conflicts }
+}
+
+/**
+ * Conflict-aware revert of one turn's own file changes.
+ *
+ * The whole plan is classified before anything is written, so a gitlink or a
+ * later-modified file is skipped up front and never triggers a mid-revert failure.
+ * Only files the turn changed and whose current content still equals the turn's
+ * end state are reverted; everything else is left untouched.
+ * @returns reverted paths and skipped conflict paths.
+ */
+export async function revertTurn(ctx, config, executable, workspace, startTree, endTree, signal) {
+  const { plan, conflicts } = await classifyTurn(ctx, config, executable, workspace, startTree, endTree, signal)
   const scratch = await mkdtemp(join(workspace.objects, 'revert-'))
   const reverted = []
-  const conflicts = []
   try {
     const env = { ...workspace.env, GIT_INDEX_FILE: join(scratch, 'index') }
-    for (const path of paths) {
-      const endOid = await treeBlobOid(ctx, config, executable, workspace, endTree, path, signal)
-      const startOid = await treeBlobOid(ctx, config, executable, workspace, startTree, path, signal)
-      const curOid = await currentOid(ctx, config, executable, workspace, path, signal)
-      const unchangedSinceTurn = endOid !== null ? curOid === endOid : curOid === null
-      if (!unchangedSinceTurn) {
-        conflicts.push(path)
-        continue
-      }
+    for (const { path, startOid } of plan) {
       if (startOid !== null) {
         const checkout = await runGit(ctx, config, executable, ['checkout', startTree, '--', path], { cwd: workspace.root, env, signal })
         if (checkout.exitCode !== 0) throw new Error(`git checkout ${path} failed: ${checkout.stderr.trim()}`)
@@ -207,7 +228,8 @@ export async function revertTurn(ctx, config, executable, workspace, startTree, 
 /**
  * Dry-run file impact of rewinding one turn: the files it changed, the revert
  * action (restore content / remove a turn-added file), and whether each is a
- * conflict (modified after the turn, so it would be skipped). Touches nothing.
+ * conflict (a non-blob gitlink/nested tree, or modified after the turn). Touches
+ * nothing.
  * @returns one {path, action, conflict} entry per changed file.
  */
 export async function previewTurn(ctx, config, executable, workspace, startTree, endTree, signal) {
@@ -216,11 +238,14 @@ export async function previewTurn(ctx, config, executable, workspace, startTree,
   const paths = diff.stdout.split('\0').filter(Boolean)
   const files = []
   for (const path of paths) {
-    const endOid = await treeBlobOid(ctx, config, executable, workspace, endTree, path, signal)
-    const startOid = await treeBlobOid(ctx, config, executable, workspace, startTree, path, signal)
-    const curOid = await currentOid(ctx, config, executable, workspace, path, signal)
+    const endEntry = await treeEntry(ctx, config, executable, workspace, endTree, path, signal)
+    const startEntry = await treeEntry(ctx, config, executable, workspace, startTree, path, signal)
+    const nonBlob = (endEntry !== null && endEntry.type !== 'blob') || (startEntry !== null && startEntry.type !== 'blob')
+    const endOid = endEntry?.type === 'blob' ? endEntry.oid : null
+    const startOid = startEntry?.type === 'blob' ? startEntry.oid : null
+    const curOid = nonBlob ? null : await currentOid(ctx, config, executable, workspace, path, signal)
     const unchangedSinceTurn = endOid !== null ? curOid === endOid : curOid === null
-    files.push({ path, action: startOid !== null ? 'restore' : 'remove', conflict: !unchangedSinceTurn })
+    files.push({ path, action: startOid !== null ? 'restore' : 'remove', conflict: nonBlob || !unchangedSinceTurn })
   }
   return files
 }

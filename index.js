@@ -366,7 +366,10 @@ export async function batchDelete(ctx, config, request) {
   // Capture the deleted Sessions' attachment references before their logs go.
   const deletedRefs = new Set()
   if (deep) {
-    for (const id of ids) for (const hex of await refsOfSession(ctx, id)) deletedRefs.add(hex)
+    for (const id of ids) {
+      const { refs } = await refsOfSession(ctx, id)
+      for (const hex of refs) deletedRefs.add(hex)
+    }
   }
 
   const results = []
@@ -384,12 +387,24 @@ export async function batchDelete(ctx, config, request) {
   let attachments = { removed: 0, kept: 0, freedBytes: 0 }
   if (deep) {
     const remainingRefs = new Set()
+    let unreadable = 0
     for (const snapshot of await ctx.sessionPersistence.list()) {
-      for (const hex of await refsOfSession(ctx, snapshot.header.id)) remainingRefs.add(hex)
+      const remainingId = snapshot.header.id
+      if (ids.includes(remainingId)) continue // a deleted Session is not a remaining reference holder
+      const { refs, readable } = await refsOfSession(ctx, remainingId)
+      if (!readable) { unreadable += 1; continue }
+      for (const hex of refs) remainingRefs.add(hex)
     }
-    const reclaimable = new Set([...deletedRefs].filter(hex => !remainingRefs.has(hex)))
-    attachments = await reclaimAttachments(ctx, reclaimable, warnings)
-    attachments.kept = deletedRefs.size - reclaimable.size
+    if (unreadable > 0) {
+      // Fail closed: an unreadable remaining Session might reference any of the
+      // deleted attachments, so nothing can be proven unreferenced. Skip GC.
+      attachments = { removed: 0, kept: deletedRefs.size, freedBytes: 0, skipped: true }
+      warnings.push(`deep attachment GC skipped: ${unreadable} remaining session(s) could not be read; all attachments preserved`)
+    } else {
+      const reclaimable = new Set([...deletedRefs].filter(hex => !remainingRefs.has(hex)))
+      attachments = await reclaimAttachments(ctx, reclaimable, warnings)
+      attachments.kept = deletedRefs.size - reclaimable.size
+    }
   }
 
   ctx.logger.info('session-delete: batch removed %d/%d sessions (%d bytes), attachments %j',
@@ -415,12 +430,14 @@ async function refsOfSession(ctx, sessionId) {
     handle = await ctx.sessionPersistence.open(sessionId, 'read')
     const { events } = await handle.read()
     for (const match of JSON.stringify(events).matchAll(/sha256:([a-f0-9]{64})/gu)) refs.add(match[1])
+    return { refs, readable: true }
   } catch {
-    // A Session that cannot be read contributes no references.
+    // An unreadable Session's references are UNKNOWN, not empty. Callers must
+    // treat readable:false as "cannot prove unreferenced" and fail closed.
+    return { refs, readable: false }
   } finally {
     await handle?.close().catch(() => {})
   }
-  return refs
 }
 
 /**

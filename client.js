@@ -828,22 +828,75 @@ function UndoIcon() {
   React.createElement('path', { d: 'M2.5 7h6.5a4 4 0 0 1 0 8H7' }))
 }
 
+/** Read a session's live chat snapshot, or undefined when unavailable. */
+function chatSnapshotOf(ctx, sessionId) {
+  try {
+    return ctx.uiConversation?.binding(sessionId)?.target('chat')?.getSnapshot()
+  } catch {
+    return undefined
+  }
+}
+
+/** All materialized chat nodes (including hidden ones), tolerating older shapes. */
+function chatNodesOf(chat) {
+  if (chat === undefined || chat === null) return []
+  if (typeof chat.nodes?.values === 'function') return [...chat.nodes.values()]
+  return (chat.order ?? []).map(key => chat.nodes?.get(key)).filter(Boolean)
+}
+
+/** The newest /rewind command node's anchorSeq, or -1 when none. */
+function latestRewindAnchor(chat) {
+  let max = -1
+  for (const node of chatNodesOf(chat)) {
+    if (node.kind === 'command' && node.data?.name === 'rewind' && typeof node.anchorSeq === 'number') {
+      if (node.anchorSeq > max) max = node.anchorSeq
+    }
+  }
+  return max
+}
+
+/**
+ * Wait for the just-executed /rewind command's settled outcome to appear in the
+ * chat snapshot (a node newer than `beforeSeq` carrying an outcome). The command
+ * result — not the `matched` admission flag — is the source of truth for success.
+ * @returns the outcome {kind, text?, sourceEventSeq?}, or undefined on timeout.
+ */
+async function waitForRewindOutcome(ctx, sessionId, beforeSeq) {
+  for (let attempt = 0; attempt < 40; attempt++) {
+    let latest
+    for (const node of chatNodesOf(chatSnapshotOf(ctx, sessionId))) {
+      if (node.kind !== 'command' || node.data?.name !== 'rewind') continue
+      if (typeof node.anchorSeq !== 'number' || node.anchorSeq <= beforeSeq) continue
+      if (node.data.outcome === undefined || node.data.outcome === null) continue
+      if (latest === undefined || node.anchorSeq > latest.anchorSeq) latest = node
+    }
+    if (latest !== undefined) return latest.data.outcome
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  return undefined
+}
+
 /** Run the undo in place via the /rewind engine command, then refill the composer
  * with the withdrawn prompt. Same session, no fork (opencode-style). The request
- * is a user-message row {sessionId, seq, text}: seq is the target, text the prompt. */
+ * is a user-message row {sessionId, seq, text}: seq is the target, text the prompt.
+ * Success is judged by the command's settled outcome, not the `matched` flag. */
 async function runUndo(ctx, request, mode) {
   const { sessionId, seq, text } = request
   const face = ctx.sessions.binding(sessionId)?.session
   if (face === undefined) return { ok: false, code: 'not-live', message: '会话不可用' }
+  const beforeSeq = latestRewindAnchor(chatSnapshotOf(ctx, sessionId))
   let result
   try {
     result = await face.command(`/rewind @${seq} ${mode === 'chat' ? 'chat' : 'both'}`)
   } catch (error) {
     return { ok: false, code: 'command-failed', message: error instanceof Error ? error.message : String(error) }
   }
-  if (result?.ok !== true || result.value?.matched !== true) {
-    return { ok: false, code: 'not-matched', message: result?.error?.message ?? '回退命令未执行' }
+  if (result?.ok !== true) {
+    return { ok: false, code: 'command-failed', message: result?.error?.message ?? '回退命令执行出错' }
   }
+  const outcome = await waitForRewindOutcome(ctx, sessionId, beforeSeq)
+  if (outcome === undefined) return { ok: false, code: 'no-outcome', message: '无法确认回退结果，请查看会话中的命令输出' }
+  if (outcome.kind !== 'success') return { ok: false, code: 'rewind-error', message: outcome.text ?? '回退失败' }
   const prefillOk = await refillComposer(ctx, sessionId, text)
   return { ok: true, prefillOk }
 }
@@ -1462,5 +1515,5 @@ function apply(ctx) {
   }
 }
 
-module.exports = { name: 'session-delete', inject: ['contextMenus', 'slots', 'locale', 'sessions', 'uiWorkspace', 'uiConversation', 'commandUi'], apply, __rewindTest: { rewindCutsOf, rewindTargetSeqOfArgs, RewindVisibilityBuilder } }
+module.exports = { name: 'session-delete', inject: ['contextMenus', 'slots', 'locale', 'sessions', 'uiWorkspace', 'uiConversation', 'commandUi'], apply, __rewindTest: { rewindCutsOf, rewindTargetSeqOfArgs, RewindVisibilityBuilder, runUndo, latestRewindAnchor, chatNodesOf } }
 return module.exports; } });

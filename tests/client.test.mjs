@@ -82,3 +82,40 @@ test('RewindVisibilityBuilder leaves everything visible without a rewind command
   const result = builder.replace({ nodes, timeline: {} })
   for (const node of result.nodes) assert.notEqual(node.visibility, 'hidden')
 })
+
+test('latestRewindAnchor / chatNodesOf read the newest rewind command node', () => {
+  const { latestRewindAnchor, chatNodesOf } = mod.__rewindTest
+  const nodes = [
+    { key: 'u1', kind: 'user', anchorSeq: 1 },
+    { key: 'c1', kind: 'command', anchorSeq: 5, data: { name: 'rewind' } },
+    { key: 'c2', kind: 'command', anchorSeq: 9, data: { name: 'rewind' } },
+    { key: 'c3', kind: 'command', anchorSeq: 12, data: { name: 'compact' } },
+  ]
+  const chat = { nodes: { values: () => nodes } }
+  assert.equal(latestRewindAnchor(chat), 9)
+  assert.equal(chatNodesOf(chat).length, 4)
+  assert.equal(latestRewindAnchor(undefined), -1)
+})
+
+test('runUndo reports failure when the command outcome is an error, not matched', async () => {
+  const { runUndo } = mod.__rewindTest
+  let materialized = []
+  const chat = { nodes: { values: () => materialized } }
+  const ctx = {
+    sessions: {
+      binding: () => ({
+        session: {
+          command: async () => {
+            materialized = [{ kind: 'command', anchorSeq: 10, data: { name: 'rewind', args: '@5 both', outcome: { kind: 'error', text: 'not in model context' } } }]
+            return { ok: true, value: { matched: true } }
+          },
+        },
+      }),
+    },
+    uiConversation: { binding: () => ({ target: () => ({ getSnapshot: () => chat }) }) },
+  }
+  const result = await runUndo(ctx, { sessionId: 's1', seq: 5, text: 'prompt' }, 'both')
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'rewind-error')
+  assert.equal(result.message, 'not in model context')
+})
