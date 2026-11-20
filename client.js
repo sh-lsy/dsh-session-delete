@@ -38,6 +38,9 @@ const DICT = {
     'dialog.scope': '将删除会话日志、缓存与工具产物；共享附件与工作区文件保留',
     'dialog.meta': '占用 {size} · 最后活动 {time}',
     'dialog.liveHint': '该会话本次运行中打开过，删除时会先停止其工作',
+    'dialog.titleConfirm': '输入会话标题以确认删除：{title}',
+    'reason.title-required': '请输入正确的会话标题以确认删除',
+    'reason.batch-title-required': '开启了标题确认，批量删除不可用；请逐个删除会话',
     'dialog.worktree': '工作树 {path}（{branch}）仅在无未提交改动时删除，分支保留',
     'dialog.children': '有 {n} 个分叉子会话，删除后其谱系将显示为断开',
     'dialog.blocked': '当前不允许删除',
@@ -92,6 +95,9 @@ const DICT = {
     'dialog.scope': 'Deletes the session log, caches, and tool artifacts; shared attachments and workspace files are kept',
     'dialog.meta': '{size} · last active {time}',
     'dialog.liveHint': 'This session was opened during this run; its work is stopped before deletion',
+    'dialog.titleConfirm': 'Type the session title to confirm deletion: {title}',
+    'reason.title-required': 'Enter the correct session title to confirm deletion',
+    'reason.batch-title-required': 'Title confirmation is enabled; batch delete is unavailable. Delete sessions individually.',
     'dialog.worktree': 'Worktree {path} ({branch}) is removed only when clean; the branch is kept',
     'dialog.children': '{n} forked child session(s) will show a broken lineage',
     'dialog.blocked': 'Deletion is not allowed',
@@ -246,6 +252,7 @@ const SESSION_DELETE_CSS = `
 }
 .sd-name { margin: 0 0 2px; font-size: 14px; line-height: 22px; font-weight: 500; color: var(--dsw-alias-label-primary); overflow-wrap: anywhere; }
 .sd-id { margin: 0 0 10px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-caption); overflow-wrap: anywhere; }
+.sd-title-input { display: block; width: 100%; margin: 6px 0 0; padding: 6px 8px; font-size: 13px; line-height: 20px; color: var(--dsw-alias-label-primary); background: var(--dsw-alias-interactive-bg-hover); border: 1px solid var(--dsw-alias-border-primary); border-radius: var(--dsw-radius-sm); box-sizing: border-box; }
 .sd-meta { margin: 0 0 10px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }
 .sd-scope { margin: 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }
 .sd-hint { margin: 10px 0 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-caption); overflow-wrap: anywhere; }
@@ -426,6 +433,7 @@ function DeleteDialog(props) {
   const request = typeof props.useRequest === 'function' ? props.useRequest(state => state) : null
   if (request !== null) dialogRendered = true
   const [phase, setPhase] = React.useState({ kind: 'idle' })
+  const [confirmText, setConfirmText] = React.useState('')
 
   React.useEffect(() => {
     if (request === null) {
@@ -433,6 +441,7 @@ function DeleteDialog(props) {
       return undefined
     }
     let cancelled = false
+    setConfirmText('')
     setPhase({ kind: 'loading' })
     post(INSPECT_PATH, { sessionId: request.sessionId })
       .then((body) => {
@@ -458,6 +467,7 @@ function DeleteDialog(props) {
     const body = await post(DELETE_PATH, {
       sessionId: request.sessionId,
       acknowledged: true,
+      ...(phase.data?.requireTitleConfirmation === true ? { confirmTitle: confirmText } : {}),
       ...(stopActivity === true ? { stopActivity: true } : {}),
     }).catch(error => ({ ok: false, code: 'network', message: String(error) }))
     if (body?.ok === true) {
@@ -477,7 +487,9 @@ function DeleteDialog(props) {
   const title = request?.displayTitle ?? ''
   const data = phase.data ?? null
   const eligible = phase.kind === 'ready' && data?.eligible === true
-  const canDelete = eligible
+  const needsTitle = data?.requireTitleConfirmation === true
+  const titleMatches = confirmText.trim() !== '' && confirmText.trim() === String(data?.title ?? '').trim()
+  const canDelete = eligible && (!needsTitle || titleMatches)
 
   const footer = (() => {
     if (phase.kind === 'done') {
@@ -512,6 +524,15 @@ function DeleteDialog(props) {
       children.push(React.createElement('div', { key: 'warning', className: 'sd-notice' }, t2('dialog.warning')))
     }
     children.push(React.createElement('div', { key: 'name', className: 'sd-name' }, title))
+    if (needsTitle) {
+      children.push(React.createElement('div', { key: 'title-confirm-label', className: 'sd-hint' },
+        t2('dialog.titleConfirm').replace('{title}', String(data?.title ?? ''))))
+      children.push(React.createElement('input', {
+        key: 'title-confirm-input', className: 'sd-title-input', type: 'text', value: confirmText,
+        placeholder: String(data?.title ?? ''), autoComplete: 'off', spellCheck: false,
+        onChange: (event) => { setConfirmText(event.target.value) },
+      }))
+    }
     children.push(React.createElement('div', { key: 'id', className: 'sd-id' }, request?.sessionId ?? ''))
     children.push(React.createElement('div', { key: 'meta', className: 'sd-meta' },
       t2('dialog.meta').replace('{size}', formatSize(data.sizeBytes)).replace('{time}', formatTime(data.lastActivity))))
@@ -756,6 +777,8 @@ const UNDO_DICT = {
     'dialog.modeChatHint': '撤回这条消息及之后的对话，不改动文件',
     'dialog.modeBoth': '回退对话和文件',
     'dialog.modeBothHint': '撤回对话，并还原其间改过的文件',
+    'dialog.steeringNote': '这是轮次中途的插话（steering），文件快照按整轮记录，无法精确对应到插话点。',
+    'dialog.steeringBothDisabled': '插话目标仅支持回退对话，不还原文件',
     'dialog.filesTitle': '将还原以下文件（之后被改过的会跳过）',
     'dialog.filesEmpty': '没有该轮的文件快照，将仅回退对话',
     'dialog.loading': '正在加载文件清单…',
@@ -791,6 +814,8 @@ const UNDO_DICT = {
     'dialog.modeChatHint': 'Withdraw this message and everything after it; leave files unchanged',
     'dialog.modeBoth': 'Conversation and files',
     'dialog.modeBothHint': 'Withdraw the conversation and revert the files changed in between',
+    'dialog.steeringNote': 'This is a mid-turn steering message; file snapshots are recorded per whole turn and cannot be matched to the steering point precisely.',
+    'dialog.steeringBothDisabled': 'Steering targets support conversation-only rewind, not file restore',
     'dialog.filesTitle': 'These files will be reverted (later-modified ones are skipped)',
     'dialog.filesEmpty': 'No file snapshot for this turn; only the conversation will be rewound',
     'dialog.loading': 'Loading file list…',
@@ -831,7 +856,7 @@ function UndoIcon() {
 /** Read a session's live chat snapshot, or undefined when unavailable. */
 function chatSnapshotOf(ctx, sessionId) {
   try {
-    return ctx.uiConversation?.binding(sessionId)?.target('chat')?.getSnapshot()
+    return ctx.get('uiConversation')?.binding(sessionId)?.target('chat')?.getSnapshot()
   } catch {
     return undefined
   }
@@ -948,14 +973,16 @@ function UndoDialog(props) {
     children.push(React.createElement('div', { key: 'done-desc', className: 'su-text' }, t2('dialog.doneDesc')))
     if (!phase.prefillOk) children.push(React.createElement('div', { key: 'done-prefill', className: 'su-error' }, t2('dialog.prefillFailed')))
   } else if (phase.kind === 'select') {
+    const steering = request?.kind === 'steering'
     children.push(React.createElement('div', { key: 'warning', className: 'su-notice' }, t2('dialog.warning')))
+    if (steering) children.push(React.createElement('div', { key: 'steering-note', className: 'su-text' }, t2('dialog.steeringNote')))
     children.push(React.createElement('div', { key: 'modes', className: 'su-modes' },
       React.createElement(Button, { variant: 'outline', className: 'su-mode', onClick: () => { void execute('chat') } },
         React.createElement('span', { className: 'su-mode-title' }, t2('dialog.modeChat')),
         React.createElement('span', { className: 'su-mode-hint' }, t2('dialog.modeChatHint'))),
-      React.createElement(Button, { variant: 'outline', className: 'su-mode', onClick: () => { void chooseFiles() } },
+      React.createElement(Button, { variant: 'outline', className: 'su-mode', disabled: steering, onClick: () => { void chooseFiles() } },
         React.createElement('span', { className: 'su-mode-title' }, t2('dialog.modeBoth')),
-        React.createElement('span', { className: 'su-mode-hint' }, t2('dialog.modeBothHint')))))
+        React.createElement('span', { className: 'su-mode-hint' }, steering ? t2('dialog.steeringBothDisabled') : t2('dialog.modeBothHint')))))
   } else if (phase.kind === 'files') {
     if (!phase.fileSnapshot || phase.files.length === 0) {
       children.push(React.createElement('div', { key: 'files-empty', className: 'su-notice' }, t2('dialog.filesEmpty')))
@@ -1044,11 +1071,23 @@ class RewindVisibilityBuilder {
   }
   get empty() { return this.inner.empty }
   replace(input) {
-    this.setAll(input.nodes)
-    this.lastSignature = this.cutSignature
-    return this.inner.replace({ nodes: this.deriveAll(), timeline: input.timeline, ...rewindChanged(input) })
+    try {
+      this.setAll(input.nodes)
+      this.lastSignature = this.cutSignature
+      return this.inner.replace({ nodes: this.deriveAll(), timeline: input.timeline, ...rewindChanged(input) })
+    } catch {
+      // Degrade to the unmodified builder input rather than crash the chat view.
+      return this.inner.replace({ nodes: input.nodes, timeline: input.timeline, ...rewindChanged(input) })
+    }
   }
   apply(input) {
+    try {
+      return this.applyDerived(input)
+    } catch {
+      return this.inner.apply({ upserts: input.upserts, timeline: input.timeline, ...rewindChanged(input) })
+    }
+  }
+  applyDerived(input) {
     const affected = new Set()
     let commandsChanged = false
     for (const node of input.upserts) {
@@ -1192,7 +1231,13 @@ function installChatViewVisibility(ctx) {
         const current = patches.get(definition)
         const create = definition.create
         if (current !== undefined && create === current.wrapper) return
-        const wrapper = function wrappedChatBuilder() { return new RewindVisibilityBuilder(create.call(definition)) }
+        const wrapper = function wrappedChatBuilder() {
+          const inner = create.call(definition)
+          // Only wrap a builder whose protocol we understand; otherwise hand back
+          // the original so a DSH builder change degrades instead of crashing.
+          if (inner === null || typeof inner !== 'object' || typeof inner.replace !== 'function' || typeof inner.apply !== 'function') return inner
+          return new RewindVisibilityBuilder(inner)
+        }
         definition.create = wrapper
         patches.set(definition, { original: create, wrapper })
         rebuildOpenSessions(ui)
@@ -1208,7 +1253,7 @@ function installChatViewVisibility(ctx) {
     if (typeof ctx.inject === 'function') {
       scope = ctx.inject(['uiConversation'], (child) => installOn(child.get('uiConversation')))
     } else {
-      installOn(ctx.get?.('uiConversation') ?? ctx.uiConversation)
+      installOn(ctx.get?.('uiConversation'))
     }
     return () => { currentCleanup?.(); currentCleanup = undefined; if (typeof scope === 'function') scope() }
   }
@@ -1237,7 +1282,7 @@ function rowTargetOf(props) {
   const sessionId = props.sessionId
   const data = props.node?.data
   if (typeof sessionId !== 'string' || typeof data?.seq !== 'number' || typeof data?.time !== 'number') return undefined
-  return { sessionId, seq: data.seq, time: data.time }
+  return { sessionId, seq: data.seq, time: data.time, kind: props.node?.kind }
 }
 
 function rowWithAction(official, render) {
@@ -1271,8 +1316,13 @@ function installRowAction(slots, render) {
     const official = rowRendererOf(entry.component)
     if (official === undefined) return false
     const replacement = rowWithAction(official, render)
-    taken.set(entry, { original: entry.component, replacement })
-    entry.component = replacement
+    const original = entry.component
+    try {
+      entry.component = replacement
+    } catch {
+      return false // frozen entry / shape change: leave the row untouched
+    }
+    taken.set(entry, { original, replacement })
     return true
   }
   const tick = () => {
@@ -1280,23 +1330,27 @@ function installRowAction(slots, render) {
     try { slots.register({ name: CHAT_NODE_SLOT, key: ROW_TICK_KEY }, () => null)() } catch { /* ignore */ }
   }
   const sync = () => {
-    let changed = false
-    for (const entry of slots.entries(CHAT_NODE_SLOT)) {
-      const key = entry.options?.key
-      if (key === undefined || !ROW_KEYS.has(key)) continue
-      if ((entry.options?.priority ?? SHIPPED_ROW_PRIORITY) !== SHIPPED_ROW_PRIORITY) continue
-      changed = takeOver(entry) || changed
-    }
-    if (changed) tick()
+    try {
+      let changed = false
+      for (const entry of slots.entries(CHAT_NODE_SLOT)) {
+        const key = entry.options?.key
+        if (key === undefined || !ROW_KEYS.has(key)) continue
+        if ((entry.options?.priority ?? SHIPPED_ROW_PRIORITY) !== SHIPPED_ROW_PRIORITY) continue
+        changed = takeOver(entry) || changed
+      }
+      if (changed) tick()
+    } catch { /* slot shape change: degrade to no ↶, never throw into apply */ }
   }
   sync()
-  const unsubscribe = slots.subscribe?.(CHAT_NODE_SLOT, sync)
+  let unsubscribe
+  try { unsubscribe = slots.subscribe?.(CHAT_NODE_SLOT, sync) } catch { /* ignore */ }
   return () => {
-    unsubscribe?.()
+    try { unsubscribe?.() } catch { /* ignore */ }
     for (const [entry, record] of taken) {
-      if (entry.component === record.replacement) entry.component = record.original
+      try { if (entry.component === record.replacement) entry.component = record.original } catch { /* ignore */ }
     }
     taken.clear()
+    tick() // nudge a re-render so restored rows drop the ↶ promptly
   }
 }
 
@@ -1322,7 +1376,7 @@ function refillComposer(ctx, sessionId, text) {
     const write = () => {
       const actx = ctx.sessions.scope?.(sessionId)
       if (actx !== undefined) {
-        try { ctx.uiConversation.input.for(actx).setDraft(text); return true } catch { /* fall through to DOM */ }
+        try { ctx.get('uiConversation')?.input.for(actx).setDraft(text); return true } catch { /* fall through to DOM */ }
       }
       const editable = document.querySelector('[data-composer-input]')
       if (editable === null) return false
@@ -1515,5 +1569,5 @@ function apply(ctx) {
   }
 }
 
-module.exports = { name: 'session-delete', inject: ['contextMenus', 'slots', 'locale', 'sessions', 'uiWorkspace', 'uiConversation', 'commandUi'], apply, __rewindTest: { rewindCutsOf, rewindTargetSeqOfArgs, RewindVisibilityBuilder, runUndo, latestRewindAnchor, chatNodesOf } }
+module.exports = { name: 'session-delete', inject: ['contextMenus', 'slots', 'locale', 'sessions'], apply, __rewindTest: { rewindCutsOf, rewindTargetSeqOfArgs, RewindVisibilityBuilder, runUndo, latestRewindAnchor, chatNodesOf } }
 return module.exports; } });

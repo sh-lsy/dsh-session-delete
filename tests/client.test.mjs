@@ -101,7 +101,9 @@ test('runUndo reports failure when the command outcome is an error, not matched'
   const { runUndo } = mod.__rewindTest
   let materialized = []
   const chat = { nodes: { values: () => materialized } }
+  const uiConversation = { binding: () => ({ target: () => ({ getSnapshot: () => chat }) }) }
   const ctx = {
+    get: (name) => name === 'uiConversation' ? uiConversation : undefined,
     sessions: {
       binding: () => ({
         session: {
@@ -112,7 +114,6 @@ test('runUndo reports failure when the command outcome is an error, not matched'
         },
       }),
     },
-    uiConversation: { binding: () => ({ target: () => ({ getSnapshot: () => chat }) }) },
   }
   const result = await runUndo(ctx, { sessionId: 's1', seq: 5, text: 'prompt' }, 'both')
   assert.equal(result.ok, false)

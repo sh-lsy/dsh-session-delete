@@ -166,6 +166,35 @@ async function serveBatch(req, res, peer, run) {
  * @param sessionId - the Session named by the caller.
  * @returns `{ ok, data }` or `{ ok: false, code, message }`.
  */
+/**
+ * The session's title for delete confirmation: the latest `session/title` event,
+ * or a fallback to the first human prompt. Read from the log so it matches what
+ * the confirmation dialog asks the user to type. Empty when unreadable.
+ */
+async function titleOfSession(ctx, sessionId) {
+  let handle
+  try {
+    handle = await ctx.sessionPersistence.open(sessionId, 'read')
+    const { events } = await handle.read()
+    let title
+    for (const event of events) {
+      if (event.type === 'session/title' && typeof event.data?.title === 'string' && event.data.title.trim() !== '') title = event.data.title
+    }
+    if (typeof title === 'string') return title.trim()
+    for (const event of events) {
+      if (event.type === 'user/message' && event.data?.source?.kind === 'user') {
+        const text = (event.data.content ?? []).filter(block => block?.type === 'text').map(block => block.text ?? '').join(' ').replace(/\s+/gu, ' ').trim()
+        if (text !== '') return text.slice(0, 80)
+      }
+    }
+    return ''
+  } catch {
+    return ''
+  } finally {
+    await handle?.close().catch(() => {})
+  }
+}
+
 export async function inspectSession(ctx, config, sessionId) {
   const snapshot = await ctx.sessionPersistence.stat(sessionId)
   if (snapshot === undefined) {
@@ -207,6 +236,7 @@ export async function inspectSession(ctx, config, sessionId) {
       archived: ctx.workspaceRegistry.archivedSessionIds.includes(sessionId),
       pinned: ctx.workspaceRegistry.pinnedSessionIds.includes(sessionId),
       requireTitleConfirmation: config.requireTitleConfirmation,
+      title: config.requireTitleConfirmation ? await titleOfSession(ctx, sessionId) : null,
     },
   }
 }
@@ -228,8 +258,9 @@ export async function deleteSession(ctx, config, request) {
     return { ok: false, code: first.code, message: first.message, details: data }
   }
   if (config.requireTitleConfirmation) {
-    if (request.acknowledged !== true || typeof request.confirmTitle !== 'string' || request.confirmTitle.trim() === '') {
-      return { ok: false, code: 'title-required', message: 'explicit acknowledgement is required' }
+    const expected = String(data.title ?? '').trim()
+    if (request.acknowledged !== true || typeof request.confirmTitle !== 'string' || request.confirmTitle.trim() === '' || request.confirmTitle.trim() !== expected) {
+      return { ok: false, code: 'title-required', message: 'type the exact session title to confirm deletion' }
     }
   }
 
@@ -246,8 +277,10 @@ export async function deleteSession(ctx, config, request) {
     }
   }
 
+  let archived = false
   try {
     await ctx.workspaceRegistry.archiveSession(sessionId, { stopActivity: true })
+    archived = true
   } catch (error) {
     // Reclamation treats a Session outside the archive set as a referrer of its
     // own checkout, so a failed archive retains the worktree instead of failing
@@ -260,6 +293,15 @@ export async function deleteSession(ctx, config, request) {
   // its closing append would recreate the deleted Session. An idle live Session
   // passes immediately; a stopped one settles within the bounded wait.
   if (data.live && !(await waitForIdle(ctx, sessionId, config.stopSettleMs))) {
+    // Restore the pre-delete archive state so a refused deletion leaves the
+    // Session usable rather than stranded in the archive.
+    if (archived) {
+      try {
+        await ctx.workspaceRegistry.unarchiveSession(sessionId)
+      } catch (error) {
+        warnings.push(`unarchive: ${messageOf(error)}`)
+      }
+    }
     return {
       ok: false,
       code: 'still-running',
@@ -361,6 +403,9 @@ export async function batchDelete(ctx, config, request) {
     return { ok: false, code: 'bad-request', message: 'sessionIds must be a non-empty array of session ids' }
   }
   const deep = request.deepAttachments === true
+  if (config.requireTitleConfirmation) {
+    return { ok: false, code: 'batch-title-required', message: 'title confirmation is enabled; batch delete is unavailable, delete sessions individually' }
+  }
   const warnings = []
 
   // Capture the deleted Sessions' attachment references before their logs go.

@@ -218,15 +218,27 @@ test('delete still honours an opt-in title confirmation', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-sd-'))
   try {
     const { log } = await sessionDir(root)
-    const ctx = makeContext({ stat: async () => snapshot(log) })
+    const ctx = makeContext({
+      stat: async () => snapshot(log),
+      logs: { [SESSION]: [{ type: 'session/title', seq: 1, data: { title: 'My Session' } }] },
+    })
     const config = resolveConfig({ requireTitleConfirmation: true })
     const refused = await deleteSession(ctx, config, { sessionId: SESSION })
     assert.equal(refused.code, 'title-required')
-    const deleted = await deleteSession(ctx, config, { sessionId: SESSION, confirmTitle: 'x', acknowledged: true })
+    const wrong = await deleteSession(ctx, config, { sessionId: SESSION, confirmTitle: 'Wrong Title', acknowledged: true })
+    assert.equal(wrong.code, 'title-required')
+    const deleted = await deleteSession(ctx, config, { sessionId: SESSION, confirmTitle: 'My Session', acknowledged: true })
     assert.equal(deleted.ok, true)
   } finally {
     await rm(root, { recursive: true, force: true })
   }
+})
+
+test('batch delete is refused when title confirmation is enabled', async () => {
+  const ctx = makeContext({})
+  const result = await batchDelete(ctx, resolveConfig({ requireTitleConfirmation: true }), { sessionIds: [SESSION] })
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'batch-title-required')
 })
 
 test('delete removes a live idle session after its turn is confirmed closed', async () => {
