@@ -113,14 +113,15 @@ dsh plugin install <本目录的绝对路径>
 
 ## 两半如何通信
 
-- Host：监听 `turn/start` 打快照（私有 git 对象库，仓库对象库作只读 alternate，不动仓库 index/refs）；owner-only 路由 `POST /session-delete/inspect|delete|batch-inspect|batch-delete` 与 `POST /session-undo/prepare|snapshots|purge`。
-- Web：注册会话/工作区右键菜单、`shell.overlay` 确认弹窗，以及 `conversation.chat.assistant-actions` 槽的撤销图标。撤销确认后调 `prepare`，再用官方客户端 `sessions.fork({ atSeq })` 分叉、打开子会话、经 conversation 输入面回填提示词。
+- Host：监听 `turn/start`/`turn/end` 打快照（私有 git 对象库，不动仓库 index/refs）；注册 `/rewind` 命令（append 表面替换标记切模型上下文 + 冲突感知还原文件）；owner-only 路由 `POST /session-delete/inspect|delete|batch-inspect|batch-delete` 与 `POST /session-undo/preview|candidates|snapshots|purge|clear-queue`。
+- Web：注册会话/工作区右键菜单与 `shell.overlay` 确认弹窗；接管用户/steering 行组件挂 ↶；包裹 chat 视图构建器按命令节点推导的区间隐藏被撤行。点 ↶ 或 `/rewind` 选目标与模式后执行 `/rewind @<seq> chat|both`，读命令实际 outcome 判成败，再经输入面 `setDraft`（DOM 兜底）回填提示词。全程同一会话，不分叉。
 
 ## 已知限制
 
 - 共享附件默认不删（官方无引用计数回收）；深度清理仅删无人引用者。
-- 撤销用影子 git 仓库，git/非 git 工作区均可；快照自安装/重启起记录；嵌套 git 目录按 gitlink 记录。
-- 回退用表面替换切模型上下文 + 客户端隐藏转录（同一会话；持久日志保留被撤轮次）；只还原该轮自己的改动，之后被改过的文件跳过。已被压缩遮掉的消息无法回退到它。
+- 撤销用影子 git 仓库，git/非 git 工作区均可；快照自安装/重启起记录，按 retentionDays 自动清理，删除会话时一并清除其快照。嵌套 git 目录（gitlink）无法逐文件还原，列为冲突跳过。
+- 回退用表面替换切模型上下文 + 客户端隐藏转录（同一会话；持久日志保留被撤轮次）；只还原该轮自己的改动，之后被改过的文件跳过。已被压缩遮掉的消息无法回退到它。steering 插话目标仅支持回退对话。
+- 早期 prepare 路径写入的旧 `[rewound]` 标记无命令节点，升级后其被撤行可能重新显示（模型上下文仍已切）；新回退均走命令节点，刷新后仍隐藏。
 - ↶ 通过接管用户/steering 行组件挂载（私有接缝，形状校验+卸载还原）；转录隐藏包裹 chat 视图构建器（亦私有）。DSH 升级改变其形状时优雅降级。
 
 ## 开发

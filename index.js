@@ -107,8 +107,12 @@ export function apply(ctx, rawConfig) {
   route(DELETE_PATH, body => deleteSession(ctx, config, body))
   route(BATCH_INSPECT_PATH, body => batchInspect(ctx, config, body.workspaceId), true)
   route(BATCH_DELETE_PATH, body => batchDelete(ctx, config, body), true)
-  mountUndo(ctx, config)
+  undoHandle = mountUndo(ctx, config)
+  ctx.effect(() => () => { undoHandle = null })
 }
+
+/** The mounted undo recorder's handle, used to forget a deleted session's snapshots. */
+let undoHandle = null
 
 /**
  * Owner gate, method gate, and bounded JSON parse shared by every route.
@@ -326,6 +330,8 @@ export async function deleteSession(ctx, config, request) {
   const spill = config.deleteSpillArtifacts ? await removeSpill(config, sessionId, warnings) : []
   const projectionCache = await dropProjectionCache(ctx, sessionId, warnings)
   await dropAccounting(ctx, sessionId, warnings)
+  // Forget the deleted session's rewind snapshots so the store does not accumulate.
+  await undoHandle?.forgetSession(sessionId)?.catch(error => warnings.push(`snapshots: ${messageOf(error)}`))
   ctx.logger.info(
     'session-delete: removed Session %s (%d bytes, worktree %s)',
     sessionId, data.sizeBytes ?? 0, worktree.status,

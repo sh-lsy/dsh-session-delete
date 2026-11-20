@@ -39,6 +39,7 @@ const DICT = {
     'dialog.meta': '占用 {size} · 最后活动 {time}',
     'dialog.liveHint': '该会话本次运行中打开过，删除时会先停止其工作',
     'dialog.titleConfirm': '输入会话标题以确认删除：{title}',
+    'dialog.worktreeStatus': '工作树回收状态：{status}（会话已删除，工作树可能稍后由官方清理）',
     'reason.title-required': '请输入正确的会话标题以确认删除',
     'reason.batch-title-required': '开启了标题确认，批量删除不可用；请逐个删除会话',
     'dialog.worktree': '工作树 {path}（{branch}）仅在无未提交改动时删除，分支保留',
@@ -96,6 +97,7 @@ const DICT = {
     'dialog.meta': '{size} · last active {time}',
     'dialog.liveHint': 'This session was opened during this run; its work is stopped before deletion',
     'dialog.titleConfirm': 'Type the session title to confirm deletion: {title}',
+    'dialog.worktreeStatus': 'Worktree reclaim status: {status} (session deleted; the worktree may be cleaned up later by the harness)',
     'reason.title-required': 'Enter the correct session title to confirm deletion',
     'reason.batch-title-required': 'Title confirmation is enabled; batch delete is unavailable. Delete sessions individually.',
     'dialog.worktree': 'Worktree {path} ({branch}) is removed only when clean; the branch is kept',
@@ -561,6 +563,15 @@ function DeleteDialog(props) {
     children.push(React.createElement('div', { key: 'done-head', className: 'sd-name' }, t2('dialog.success')))
     children.push(React.createElement('div', { key: 'done-size', className: 'sd-meta' },
       t2('dialog.successSize').replace('{size}', formatSize(phase.data?.bytes))))
+    const worktree = phase.data?.worktree
+    if (worktree?.status && worktree.status !== 'absent' && worktree.status !== 'cleaned') {
+      children.push(React.createElement('div', { key: 'done-worktree', className: 'sd-hint' },
+        t2('dialog.worktreeStatus').replace('{status}', String(worktree.status))))
+    }
+    const warnings = phase.data?.warnings
+    if (Array.isArray(warnings) && warnings.length > 0) {
+      children.push(React.createElement('div', { key: 'done-warnings', className: 'sd-hint' }, warnings.join(' · ')))
+    }
   }
   if (phase.kind === 'error') {
     const reasonKey = phase.code === undefined ? undefined : `reason.${String(phase.code)}`

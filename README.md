@@ -159,19 +159,22 @@ After installing, refresh the Web page once; the entry appears on the next right
 
 ## How the two halves talk
 
-The Node half registers two owner-only HTTP routes:
+The Node half registers owner-only HTTP routes (all require `peer.principal.kind === 'owner'`):
 
-- `POST /session-delete/inspect` — read-only inventory and refusal reasons.
-- `POST /session-delete/delete` — the deletion, or a `needs-stop` reply listing planned work.
+- `POST /session-delete/inspect|delete|batch-inspect|batch-delete` — inventory, deletion (or a `needs-stop` reply), and batch cleanup with reference-counted attachment GC.
+- `POST /session-undo/preview|candidates|snapshots|purge|clear-queue` — file-impact preview, rewind candidate list, and snapshot store maintenance.
 
-Both require `peer.principal.kind === 'owner'`. The Web half (`client.js`) is a hand-written Client bundle in the `__ModuleLoader__.load` format, so it needs no build toolchain and no imports beyond the shell baseline (`react`, `@deepseek-ai/dsh-client-ui-primitives`).
+It also registers the `/rewind` command (appends a surface-replace marker to cut the model context and reverts the turn's files conflict-aware) and records a shadow-git snapshot at each turn start/end.
+
+The Web half (`client.js`) is a hand-written Client bundle in the `__ModuleLoader__.load` format (no build toolchain; only the shell baseline `react` and `@deepseek-ai/dsh-client-ui-primitives`). It registers the context menus and `shell.overlay` dialogs, mounts ↶ on user/steering rows, wraps the chat view builder to hide withdrawn rows (cuts derived from the durable rewind command node), and drives `/rewind @<seq> chat|both` — judging success by the command's settled outcome, then refilling the composer via `setDraft` (DOM fallback). All in the same session, no fork.
 
 ## Known limitations
 
 - A live Session's in-memory object stays attached after deletion (Harness has no public eviction API). It is archived, so it runs no further turn and appends nothing; the sidebar row is removed on refresh. The orphan is released when the process exits.
 - A deleted Session's id stays in the Workspace registry's in-memory header index until the next start; the row is removed immediately and the stale index entry is unreachable from the UI.
 - Lineage: deleting a Session that other Sessions forked from leaves their `parentSession` pointing at nothing. The dialog warns with the child count; only the displayed lineage is affected.
-- Rewind snapshots start at install/restart; earlier turns have none (file restore falls back to conversation-only). A nested directory that is itself a git repo is snapshotted as a gitlink, not file-by-file. Rewind cuts the model context via a surface replacement and hides the transcript client-side (same session; the durable log keeps the withdrawn turns). Only the turn's own changes are reverted; files modified afterward are skipped. A message already shadowed by compaction cannot be rewound to.
+- Rewind snapshots start at install/restart; earlier turns have none (file restore falls back to conversation-only). Snapshots auto-purge after `retentionDays` and are forgotten when a session is deleted. A nested git directory (gitlink) cannot be reverted file-by-file and is skipped as a conflict. Rewind cuts the model context via a surface replacement and hides the transcript client-side (same session; the durable log keeps the withdrawn turns). Only the turn's own changes are reverted; files modified afterward are skipped. A message already shadowed by compaction cannot be rewound to; steering targets support conversation-only rewind.
+- Legacy `[rewound]` markers written by the old prepare path have no command node, so their withdrawn rows may reappear after upgrade (the model context is still cut); new rewinds use command nodes and stay hidden across reloads.
 - The ↶ action mounts on the user/steering message row by taking over the shipped row component (a private seam, shape-checked and restored on unload); the transcript-hiding wraps the chat view builder (also private). Both degrade gracefully if a DSH upgrade changes their shape.
 
 ## Development

@@ -15,11 +15,10 @@
  */
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-const PREPARE_PATH = '/session-undo/prepare'
 const SNAPSHOTS_PATH = '/session-undo/snapshots'
 const PURGE_PATH = '/session-undo/purge'
 const CLEAR_QUEUE_PATH = '/session-undo/clear-queue'
@@ -120,9 +119,11 @@ export async function locateWorkspace(ctx, config, executable, cwd, signal) {
     const init = await runGit(ctx, config, executable, ['init', '--bare', '-q'], { cwd: gitDir, signal })
     if (init.exitCode !== 0) throw new Error(`git init shadow failed: ${init.stderr.trim()}`)
     await runGit(ctx, config, executable, ['config', 'core.bare', 'false'], { cwd: gitDir, env: { GIT_DIR: gitDir }, signal })
-    await mkdir(join(gitDir, 'info'), { recursive: true })
-    await writeFile(join(gitDir, 'info', 'exclude'), `${config.snapshotExcludes.join('\n')}\n`)
   }
+  // Rewrite excludes on every locate so a config change takes effect without
+  // re-initializing the shadow repo.
+  await mkdir(join(gitDir, 'info'), { recursive: true })
+  await writeFile(join(gitDir, 'info', 'exclude'), `${config.snapshotExcludes.join('\n')}\n`)
   const env = { GIT_DIR: gitDir, GIT_WORK_TREE: cwd }
   return { root: cwd, gitDir, objects: join(gitDir, 'objects'), env, excludes: [] }
 }
@@ -304,23 +305,27 @@ export function mountUndo(ctx, config) {
   const root = dataRootOf(config)
   const storeFile = join(root, 'snapshots.json')
   const snapshots = new Map()
-  let loaded = false
   let writeTail = Promise.resolve()
 
   const load = async () => {
-    if (loaded) return
-    loaded = true
     await mkdir(root, { recursive: true })
     try {
       const parsed = JSON.parse(await readFile(storeFile, 'utf8'))
-      for (const record of parsed) snapshots.set(`${record.sessionId}#${record.turn}`, record)
+      if (Array.isArray(parsed)) for (const record of parsed) snapshots.set(`${record.sessionId}#${record.turn}`, record)
     } catch {
       // A missing or unreadable store starts empty.
     }
   }
+  // Start loading immediately; recorders await this so a startup turn cannot
+  // overwrite records that have not been read yet.
+  const loadPromise = load()
   const persist = () => {
     writeTail = writeTail.then(async () => {
-      await writeFile(storeFile, JSON.stringify([...snapshots.values()]))
+      await loadPromise
+      // Atomic replace: a crash mid-write leaves the previous store intact.
+      const tmp = `${storeFile}.${process.pid}.tmp`
+      await writeFile(tmp, JSON.stringify([...snapshots.values()]))
+      await rename(tmp, storeFile)
     }).catch(error => ctx.logger.warn(`session-undo: persist failed: ${String(error)}`))
     return writeTail
   }
@@ -357,7 +362,6 @@ export function mountUndo(ctx, config) {
   }
 
   ctx.effect(() => async () => { await writeTail })
-  void load()
 
   ctx.on('session/event', (session, event) => {
     if (!config.snapshotEnabled) return
@@ -381,7 +385,6 @@ export function mountUndo(ctx, config) {
     handler: (req, res, peer) => serveUndo(ctx, req, res, peer, run),
   }), `session-undo: POST ${path}`)
 
-  route(PREPARE_PATH, body => prepare(ctx, config, executable, snapshots, body))
   route(SNAPSHOTS_PATH, body => listSnapshots(snapshots, body))
   route(PURGE_PATH, () => purge(ctx, config, snapshots, persist))
   route(CLEAR_QUEUE_PATH, body => clearQueue(ctx, body))
@@ -414,6 +417,22 @@ export function mountUndo(ctx, config) {
       handler: rewindHandler,
     }), 'session-undo: /rewind command')
   })
+
+  // Drop a deleted session's snapshot records so the store does not grow forever.
+  const forgetSession = async (sessionId) => {
+    await loadPromise
+    let changed = false
+    for (const [key, record] of snapshots) {
+      if (record.sessionId === sessionId) {
+        snapshots.delete(key)
+        changed = true
+      }
+    }
+    if (changed) await persist()
+  }
+  // Enforce the retention window once at mount (the owner purge route still works).
+  void loadPromise.then(() => purge(ctx, config, snapshots, persist)).catch(() => {})
+  return { forgetSession }
 }
 
 /**
@@ -649,69 +668,6 @@ export function listCandidates(ctx, body) {
     candidates.push({ seq: event.seq, time: event.time, preview, text })
   }
   return { ok: true, data: { candidates } }
-}
-
-/**
- * Undo one turn in place: revert the turn's own file changes (conflict-aware)
- * and shadow the turn from the model-visible conversation surface, keeping the
- * same session. Returns the undone prompt for the composer.
- */
-export async function prepare(ctx, config, executable, snapshots, body) {
-  const sessionId = body.sessionId
-  const messageId = body.messageId
-  if (typeof sessionId !== 'string' || typeof messageId !== 'string') {
-    return { ok: false, code: 'bad-request', message: 'sessionId and messageId are required' }
-  }
-  if (ctx.get('agents')?.get(sessionId)?.status === 'running') {
-    return { ok: false, code: 'session-busy', message: 'the session is running a turn; stop it before undoing' }
-  }
-  const observed = await ctx.sessionQuery.observeSession(sessionId)
-  let rewind
-  try {
-    rewind = resolveRewind(observed.events, messageId)
-  } finally {
-    observed[Symbol.dispose]?.()
-  }
-  if (rewind.code !== undefined) {
-    return { ok: false, code: rewind.code, message: `cannot undo: ${rewind.code}` }
-  }
-  // Validate the in-place conversation rewind before touching any files.
-  const range = surfaceRewindRange(ctx, sessionId, rewind.boundary)
-  if (range.code !== undefined) return { ok: false, code: range.code, message: range.message }
-
-  // File revert is best-effort: conversation rewind works even without a snapshot.
-  let reverted = []
-  let conflicts = []
-  let fileSnapshot = false
-  const snapshot = snapshots.get(`${sessionId}#${rewind.turn}`)
-  if (snapshot?.startTree != null && snapshot?.endTree != null) {
-    const exe = await executable()
-    if (exe !== null) {
-      const workspace = await locateWorkspace(ctx, config, exe, snapshot.cwd, new AbortController().signal)
-      if (workspace !== null) {
-        const result = await revertTurn(ctx, config, exe, workspace, snapshot.startTree, snapshot.endTree, new AbortController().signal)
-        reverted = result.reverted
-        conflicts = result.conflicts
-        fileSnapshot = true
-      }
-    }
-  }
-
-  // Commit the in-place surface replacement: same session, view truncated.
-  // The marker is built inline (a frozen user message) so the plugin needs no
-  // core-package import, which the external plugin's resolution cannot provide.
-  const marker = deepFreeze({
-    id: randomUUID(),
-    role: 'user',
-    content: [{ type: 'text', text: '[rewound]' }],
-    source: { kind: 'user' },
-  })
-  range.session.append('user/message', marker, {
-    surfaceOp: { op: 'replace', startSeq: range.startSeq, endSeq: range.endSeq },
-    sourceEventSeqs: range.shadowed,
-  })
-  ctx.logger.info('session-undo: rewound %s turn %d in place (%d files reverted, %d conflicts)', sessionId, rewind.turn, reverted.length, conflicts.length)
-  return { ok: true, data: { prompt: rewind.prompt, turn: rewind.turn, reverted, conflicts, fileSnapshot } }
 }
 
 /** List the recorded turn snapshots for one session, newest first. */
