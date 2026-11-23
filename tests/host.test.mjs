@@ -59,8 +59,12 @@ function makeContext(options = {}) {
       get: (id) => workspaces.find(workspace => workspace.id === id),
       get archivedSessionIds() { return [...archived] },
       get pinnedSessionIds() { return [...pinned] },
-      archiveSession: async (id) => { archived.add(id) },
+      archiveSession: async (id) => {
+        if (options.failArchive) throw new Error('archive failed')
+        archived.add(id); pinned.delete(id) // archive drops the pin in the same write
+      },
       unarchiveSession: async (id) => { archived.delete(id) },
+      pinSession: async (id) => { if (archived.has(id)) throw new Error('cannot pin an archived session'); pinned.add(id) },
       unpinSession: async (id) => { pinned.delete(id) },
     },
     waterfall: async (_name, _payload, next) => next(),
@@ -298,9 +302,9 @@ test('a vanished directory is an idempotent success', async () => {
 })
 
 /** One stored snapshot whose header id matches the session it describes. */
-function snapFor(log, id) {
+function snapFor(log, id, overrides = {}) {
   const base = snapshot(log)
-  return { ...base, header: { ...base.header, id } }
+  return { ...base, ...overrides, header: { ...base.header, id } }
 }
 
 test('batchInspect lists a workspace sessions and refuses an unknown workspace', async () => {
@@ -426,6 +430,94 @@ test('batchDelete deep cleanup fails closed when a remaining session is unreadab
     assert.equal(existsSync(join(attachRoot, 'objects', hexA.slice(0, 2), hexA)), true)
     assert.equal(existsSync(join(attachRoot, 'objects', hexC.slice(0, 2), hexC)), true)
     assert.ok(result.data.warnings.some(w => w.includes('skipped')))
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('batchDelete deep cleanup preserves attachments of a session whose deletion failed', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-sd-'))
+  try {
+    const hexA = 'a'.repeat(64)
+    const hexB = 'b'.repeat(64)
+    const hexC = 'c'.repeat(64)
+    const s1 = SESSION
+    const s2 = 'session-22222222-2222-3333-4444-555555555555'
+    const s3 = 'session-33333333-2222-3333-4444-555555555555'
+    const dirs = { [s1]: await sessionDir(root, s1), [s2]: await sessionDir(root, s2), [s3]: await sessionDir(root, s3) }
+    const logs = {
+      [s1]: [{ attachment: { attachmentId: `sha256:${hexA}` } }, { attachment: { attachmentId: `sha256:${hexC}` } }],
+      [s2]: [{ attachment: { attachmentId: `sha256:${hexB}` } }],
+      [s3]: [{ attachment: { attachmentId: `sha256:${hexC}` } }],
+    }
+    const attachRoot = join(root, 'attachments', 'v1')
+    for (const hex of [hexA, hexB, hexC]) {
+      await mkdir(join(attachRoot, 'objects', hex.slice(0, 2)), { recursive: true })
+      await writeFile(join(attachRoot, 'objects', hex.slice(0, 2), hex), 'bytes')
+    }
+    const workspace = { id: 'w1', path: '/tmp/demo', sessionIds: [s1, s2, s3], async detachSession() {} }
+    const ctx = makeContext({
+      workspaces: [workspace],
+      logs,
+      // s2 cannot be deleted (migration-required) so it stays on disk holding hexB.
+      stat: async (id) => snapFor(dirs[id].log, id, id === s2 ? { formatStatus: 'migration-required' } : {}),
+      list: async () => [s1, s2, s3].map(id => snapFor(dirs[id].log, id)).filter(s => existsSync(s.location.path)),
+      services: { attachments: { root: attachRoot } },
+    })
+    const result = await batchDelete(ctx, resolveConfig(undefined), { sessionIds: [s1, s2], deepAttachments: true })
+    assert.equal(result.ok, true)
+    assert.equal(result.data.results.find(r => r.sessionId === s1).ok, true)
+    assert.equal(result.data.results.find(r => r.sessionId === s2).ok, false)
+    // s1's exclusive hexA reclaimed; failed s2's hexB and shared hexC preserved.
+    assert.equal(existsSync(join(attachRoot, 'objects', hexA.slice(0, 2), hexA)), false)
+    assert.equal(existsSync(join(attachRoot, 'objects', hexB.slice(0, 2), hexB)), true)
+    assert.equal(existsSync(join(attachRoot, 'objects', hexC.slice(0, 2), hexC)), true)
+    assert.equal(result.data.attachments.removed, 1)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a still-running refusal unarchives and restores the pin', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-sd-'))
+  try {
+    const { directory, log } = await sessionDir(root)
+    const ctx = makeContext({ stat: async () => snapshot(log), live: true, agentStatus: 'running', pinned: [SESSION] })
+    const deleted = await deleteSession(ctx, resolveConfig({ stopSettleMs: 50 }), { sessionId: SESSION, stopActivity: true })
+    assert.equal(deleted.ok, false)
+    assert.equal(deleted.code, 'still-running')
+    assert.equal(ctx.archived.has(SESSION), false)
+    assert.equal(ctx.pinned.has(SESSION), true)
+    assert.equal((await stat(directory)).isDirectory(), true)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a failed archive aborts the deletion', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-sd-'))
+  try {
+    const { directory, log } = await sessionDir(root)
+    const ctx = makeContext({ stat: async () => snapshot(log), failArchive: true })
+    const deleted = await deleteSession(ctx, resolveConfig(undefined), { sessionId: SESSION })
+    assert.equal(deleted.ok, false)
+    assert.equal(deleted.code, 'archive-failed')
+    assert.equal((await stat(directory)).isDirectory(), true)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a title-less session is deletable with acknowledgement when title confirmation is on', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-sd-'))
+  try {
+    const { log } = await sessionDir(root)
+    const ctx = makeContext({ stat: async () => snapshot(log), logs: { [SESSION]: [] } })
+    const config = resolveConfig({ requireTitleConfirmation: true })
+    const refused = await deleteSession(ctx, config, { sessionId: SESSION })
+    assert.equal(refused.code, 'title-required')
+    const deleted = await deleteSession(ctx, config, { sessionId: SESSION, acknowledged: true })
+    assert.equal(deleted.ok, true)
   } finally {
     await rm(root, { recursive: true, force: true })
   }

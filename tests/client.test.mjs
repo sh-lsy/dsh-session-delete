@@ -120,3 +120,17 @@ test('runUndo reports failure when the command outcome is an error, not matched'
   assert.equal(result.code, 'rewind-error')
   assert.equal(result.message, 'not in model context')
 })
+
+test('rowRendererOf refuses class components so a DSH upgrade cannot crash the row', () => {
+  const { isClassComponent, rowRendererOf } = mod.__rewindTest
+  function FnRow() { return null }
+  class ClassRow { render() { return null } }
+  ClassRow.prototype.isReactComponent = {}
+  assert.equal(isClassComponent(FnRow), false)
+  assert.equal(isClassComponent(ClassRow), true)
+  assert.equal(rowRendererOf(FnRow), FnRow)
+  assert.equal(rowRendererOf(ClassRow), undefined)
+  // memo-wrapped class component is also refused.
+  assert.equal(rowRendererOf({ type: ClassRow }), undefined)
+  assert.equal(rowRendererOf({ type: FnRow }), FnRow)
+})

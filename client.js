@@ -489,7 +489,7 @@ function DeleteDialog(props) {
   const title = request?.displayTitle ?? ''
   const data = phase.data ?? null
   const eligible = phase.kind === 'ready' && data?.eligible === true
-  const needsTitle = data?.requireTitleConfirmation === true
+  const needsTitle = data?.requireTitleConfirmation === true && String(data?.title ?? '').trim() !== ''
   const titleMatches = confirmText.trim() !== '' && confirmText.trim() === String(data?.title ?? '').trim()
   const canDelete = eligible && (!needsTitle || titleMatches)
 
@@ -934,7 +934,7 @@ async function runUndo(ctx, request, mode) {
   if (outcome === undefined) return { ok: false, code: 'no-outcome', message: '无法确认回退结果，请查看会话中的命令输出' }
   if (outcome.kind !== 'success') return { ok: false, code: 'rewind-error', message: outcome.text ?? '回退失败' }
   const prefillOk = await refillComposer(ctx, sessionId, text)
-  return { ok: true, prefillOk }
+  return { ok: true, prefillOk, summary: outcome.text ?? '' }
 }
 
 /** The undo confirmation dialog hosted in shell.overlay. */
@@ -954,7 +954,7 @@ function UndoDialog(props) {
     setPhase({ kind: 'working' })
     const result = await props.confirmUndo(request, mode)
     setPhase(result?.ok === true
-      ? { kind: 'done', prefillOk: result.prefillOk === true }
+      ? { kind: 'done', prefillOk: result.prefillOk === true, summary: result.summary ?? '' }
       : { kind: 'error', code: result?.code, message: result?.message })
   }
   const chooseFiles = async () => {
@@ -982,6 +982,7 @@ function UndoDialog(props) {
   if (phase.kind === 'done') {
     children.push(React.createElement('div', { key: 'done-title', className: 'su-text', style: { fontWeight: 500, color: 'var(--dsw-alias-label-primary)' } }, t2('dialog.doneTitle')))
     children.push(React.createElement('div', { key: 'done-desc', className: 'su-text' }, t2('dialog.doneDesc')))
+    if (phase.summary) children.push(React.createElement('div', { key: 'done-summary', className: 'su-text' }, phase.summary))
     if (!phase.prefillOk) children.push(React.createElement('div', { key: 'done-prefill', className: 'su-error' }, t2('dialog.prefillFailed')))
   } else if (phase.kind === 'select') {
     const steering = request?.kind === 'steering'
@@ -1282,11 +1283,16 @@ const ROW_KEYS = new Set(['user', 'steering'])
 const SHIPPED_ROW_PRIORITY = 0
 const ROW_TICK_KEY = 'session-undo:mount'
 
+function isClassComponent(fn) {
+  const proto = fn?.prototype
+  return proto != null && (proto.isReactComponent != null || typeof proto.render === 'function')
+}
+
 function rowRendererOf(component) {
-  if (typeof component === 'function') return component
+  if (typeof component === 'function') return isClassComponent(component) ? undefined : component
   if (component === null || typeof component !== 'object') return undefined
   const type = component.type
-  return typeof type === 'function' ? type : undefined
+  return typeof type === 'function' && !isClassComponent(type) ? type : undefined
 }
 
 function rowTargetOf(props) {
@@ -1298,7 +1304,15 @@ function rowTargetOf(props) {
 
 function rowWithAction(official, render) {
   return function RowWithAction(props) {
-    const row = official(typeof props.renderSlotChain === 'function' ? props : { ...props, renderSlotChain: () => null })
+    const composed = typeof props.renderSlotChain === 'function' ? props : { ...props, renderSlotChain: () => null }
+    let row
+    try {
+      row = official(composed)
+    } catch {
+      // The official renderer threw (e.g. a DSH upgrade made it a class component):
+      // render it the standard way rather than crashing the whole row.
+      return React.createElement(official, composed)
+    }
     const target = rowTargetOf(props)
     if (target === undefined || !React.isValidElement(row)) return row
     const actions = row.props.actions
@@ -1580,5 +1594,5 @@ function apply(ctx) {
   }
 }
 
-module.exports = { name: 'session-delete', inject: ['contextMenus', 'slots', 'locale', 'sessions'], apply, __rewindTest: { rewindCutsOf, rewindTargetSeqOfArgs, RewindVisibilityBuilder, runUndo, latestRewindAnchor, chatNodesOf } }
+module.exports = { name: 'session-delete', inject: ['contextMenus', 'slots', 'locale', 'sessions'], apply, __rewindTest: { rewindCutsOf, rewindTargetSeqOfArgs, RewindVisibilityBuilder, runUndo, latestRewindAnchor, chatNodesOf, isClassComponent, rowRendererOf } }
 return module.exports; } });

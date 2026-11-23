@@ -344,3 +344,22 @@ test('revertTurn/previewTurn skip a nested git repo (gitlink) as a conflict, no 
     await rm(data, { recursive: true, force: true })
   }
 })
+
+test('executeRewind forces conversation-only for a mid-turn steering target even with both', async () => {
+  const events = [
+    { seq: 0, type: 'turn/start', data: { turn: 1 } },
+    { seq: 1, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'first prompt' }] } },
+    { seq: 2, type: 'assistant/message', data: { turn: 1, message: { id: 'a1' } } },
+    { seq: 3, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'steering interjection' }] } },
+    { seq: 4, type: 'assistant/message', data: { turn: 1, message: { id: 'a2' } } },
+  ]
+  const session = { id: 's1', header: {}, snapshotEvents: () => events, surface: { nodes: [1, 2, 3, 4] }, append: () => ({ seq: 5 }) }
+  const agent = { session, status: 'idle', whenIdle: async () => {}, cancel: () => {} }
+  const ctx = { logger: { info() {}, warn() {} }, get: () => undefined }
+  // A whole-turn snapshot exists, but the steering target (seq 3) is not the turn's
+  // first prompt (seq 1), so file restore must be skipped despite mode 'both'.
+  const snapshots = new Map([['s1#1', { sessionId: 's1', turn: 1, startTree: 'x', endTree: 'y', cwd: '/tmp' }]])
+  const result = await executeRewind(ctx, resolveUndoConfig({}), async () => 'git', snapshots, agent, 3, 'both', undefined)
+  assert.equal(result.fileSnapshot, false)
+  assert.deepEqual(result.reverted, [])
+})

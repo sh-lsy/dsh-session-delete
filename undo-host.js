@@ -405,7 +405,10 @@ export function mountUndo(ctx, config) {
     try {
       const result = await executeRewind(ctx, config, executable, snapshots, agent, targetSeq, mode, invocation.signal)
       if (result.code !== undefined) return { kind: 'error', text: result.message ?? result.code }
-      return { kind: 'success', text: `Rewound to message @${targetSeq}.`, sourceEventSeq: result.markerSeq }
+      const fileSummary = result.fileSnapshot
+        ? ` Reverted ${result.reverted.length} file(s), skipped ${result.conflicts.length} conflict(s).`
+        : ' Conversation only.'
+      return { kind: 'success', text: `Rewound to message @${targetSeq}.${fileSummary}`, sourceEventSeq: result.markerSeq }
     } catch (error) {
       return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
     }
@@ -570,10 +573,22 @@ export async function executeRewind(ctx, config, executable, snapshots, agent, t
   const turn = turnOfSeq(events, targetSeq)
   const prompt = textOf(targetEvent.data.content)
 
+  // A steering / mid-turn user message is not the turn's first prompt, but the
+  // file snapshot spans the whole turn, so restoring files for it would be
+  // inaccurate. Force conversation-only for such targets even if 'both' was asked
+  // (the UI already disables it; this guards the hand-typed command path too).
+  let effectiveMode = mode
+  if (mode === 'both' && turn !== undefined) {
+    const turnStart = events.find(event => event.type === 'turn/start' && event.data?.turn === turn)
+    const firstUser = turnStart === undefined ? undefined
+      : events.find(event => event.type === 'user/message' && event.data?.source?.kind === 'user' && event.seq > turnStart.seq)
+    if (firstUser === undefined || firstUser.seq !== targetSeq) effectiveMode = 'chat'
+  }
+
   let reverted = []
   let conflicts = []
   let fileSnapshot = false
-  if (mode === 'both' && turn !== undefined) {
+  if (effectiveMode === 'both' && turn !== undefined) {
     const snapshot = snapshots.get(`${sessionId}#${turn}`)
     if (snapshot?.startTree != null && snapshot?.endTree != null) {
       const exe = await executable()

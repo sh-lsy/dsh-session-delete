@@ -263,7 +263,12 @@ export async function deleteSession(ctx, config, request) {
   }
   if (config.requireTitleConfirmation) {
     const expected = String(data.title ?? '').trim()
-    if (request.acknowledged !== true || typeof request.confirmTitle !== 'string' || request.confirmTitle.trim() === '' || request.confirmTitle.trim() !== expected) {
+    if (request.acknowledged !== true) {
+      return { ok: false, code: 'title-required', message: 'explicit acknowledgement is required' }
+    }
+    // A session with no title/first prompt has nothing to type; acknowledgement
+    // alone suffices (otherwise the empty-title match would be unsatisfiable).
+    if (expected !== '' && (typeof request.confirmTitle !== 'string' || request.confirmTitle.trim() !== expected)) {
       return { ok: false, code: 'title-required', message: 'type the exact session title to confirm deletion' }
     }
   }
@@ -281,15 +286,39 @@ export async function deleteSession(ctx, config, request) {
     }
   }
 
+  const wasPinned = data.pinned === true
   let archived = false
   try {
     await ctx.workspaceRegistry.archiveSession(sessionId, { stopActivity: true })
     archived = true
   } catch (error) {
-    // Reclamation treats a Session outside the archive set as a referrer of its
-    // own checkout, so a failed archive retains the worktree instead of failing
-    // the deletion.
-    warnings.push(`archive: ${messageOf(error)}`)
+    // Without the archive gate a new turn could start mid-deletion and recreate
+    // the Session, so a failed archive aborts rather than proceeding unsafe.
+    return {
+      ok: false,
+      code: 'archive-failed',
+      message: `could not archive the Session before deletion: ${messageOf(error)}`,
+      details: { worktree: null, warnings },
+    }
+  }
+
+  // Restore the pre-delete registry state on any refusal after archiving:
+  // unarchive, and re-pin if it was pinned (archive drops the pin in the same
+  // write and unarchive does not restore it). Pin requires the id unarchived first.
+  const rollbackArchive = async () => {
+    if (!archived) return
+    try {
+      await ctx.workspaceRegistry.unarchiveSession(sessionId)
+    } catch (error) {
+      warnings.push(`unarchive: ${messageOf(error)}`)
+    }
+    if (wasPinned) {
+      try {
+        await ctx.workspaceRegistry.pinSession(sessionId)
+      } catch (error) {
+        warnings.push(`repin: ${messageOf(error)}`)
+      }
+    }
   }
 
   // A live Agent holds an open write handle. Archiving blocks new turns, but a
@@ -297,15 +326,7 @@ export async function deleteSession(ctx, config, request) {
   // its closing append would recreate the deleted Session. An idle live Session
   // passes immediately; a stopped one settles within the bounded wait.
   if (data.live && !(await waitForIdle(ctx, sessionId, config.stopSettleMs))) {
-    // Restore the pre-delete archive state so a refused deletion leaves the
-    // Session usable rather than stranded in the archive.
-    if (archived) {
-      try {
-        await ctx.workspaceRegistry.unarchiveSession(sessionId)
-      } catch (error) {
-        warnings.push(`unarchive: ${messageOf(error)}`)
-      }
-    }
+    await rollbackArchive()
     return {
       ok: false,
       code: 'still-running',
@@ -319,6 +340,7 @@ export async function deleteSession(ctx, config, request) {
   try {
     await removeWithRetry(data.directory)
   } catch (error) {
+    await rollbackArchive()
     return {
       ok: false,
       code: 'delete-failed',
@@ -437,11 +459,14 @@ export async function batchDelete(ctx, config, request) {
 
   let attachments = { removed: 0, kept: 0, freedBytes: 0 }
   if (deep) {
+    // Only sessions actually deleted stop being reference holders. A session whose
+    // deletion failed is still on disk and must keep protecting its attachments.
+    const deletedIds = new Set(results.filter(result => result.ok).map(result => result.sessionId))
     const remainingRefs = new Set()
     let unreadable = 0
     for (const snapshot of await ctx.sessionPersistence.list()) {
       const remainingId = snapshot.header.id
-      if (ids.includes(remainingId)) continue // a deleted Session is not a remaining reference holder
+      if (deletedIds.has(remainingId)) continue
       const { refs, readable } = await refsOfSession(ctx, remainingId)
       if (!readable) { unreadable += 1; continue }
       for (const hex of refs) remainingRefs.add(hex)
