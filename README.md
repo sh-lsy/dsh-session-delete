@@ -29,7 +29,7 @@ Deletion is permanent; there is no trash. For the target Session only:
 
 | Artifact | Location |
 |---|---|
-| Session log, every generation and compressed copy | `$DSH_HOME/projects/<project>/sessions/<id>/` |
+| Session log, every generation and compressed copy | `$DSH_HOME/sessions/--<project-slug>--/<session-id>/` (the session root is the profile's `session-persistence-jsonl` `root`; the default install uses `$DSH_HOME/sessions`) |
 | Projection-cache document | storage domain `session_projcache`, table `sessions` |
 | Large tool-output spill files | `<tmp>/dsh-spill-*/session-<hash>/` |
 | Worktree | through the shipped reclamation: removed only when the checkout is clean and unreferenced; **the branch is kept** |
@@ -78,7 +78,7 @@ The bundle patch mounts one row. Override its `config` in your profile's `cordis
     retentionDays: 7                 # purge undo snapshot metadata after N days
     timeoutMs: 30000                 # per-git-command timeout for undo snapshots
     outputMaxBytes: 8388608          # git output cap for undo snapshots
-    dataRoot: ''                     # undo data root; empty = ~/.dsh/session-undo
+    dataRoot: ''                     # undo data root; empty = $DSH_HOME/session-undo (default ~/.dsh/session-undo)
     snapshotExcludes:                # heavy dirs kept out of undo snapshots
       - node_modules/
       - .git/
@@ -180,12 +180,14 @@ The Web half (`client.js`) is a hand-written Client bundle in the `__ModuleLoade
 ## Development
 
 ```sh
-node tests/host.test.mjs      # delete / batch + route/command registration (13 tests)
-node tests/undo.test.mjs      # rewind planning, real git/non-git conflict-aware restore (15 tests)
-node tests/client.test.mjs    # chat-visibility cut derivation + hiding (4 tests)
+node tests/host.test.mjs      # delete / batch + route/command registration (25 tests)
+node tests/undo.test.mjs      # rewind planning, real git/non-git conflict-aware restore (21 tests)
+node tests/client.test.mjs    # chat-visibility cut derivation + hiding (10 tests)
 ```
 
 `node --test tests/` spawns a child process per file, which some sandboxes block; running the file directly keeps the run in-process.
+
+`engines.dsh` carries an upper bound (`<0.2.4`): DSH reads it alone for compatibility, and the private chat/row seams are only tested up to that release. After testing a newer DSH release, raise the bound and re-run the three suites. An installation that previously set `DSH_HOME` kept its undo store under the old `~/.dsh/session-undo` default; point `dataRoot` there to keep using those snapshots.
 
 ## Credits
 

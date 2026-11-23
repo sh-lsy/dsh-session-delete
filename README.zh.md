@@ -22,7 +22,7 @@
 
 | 产物 | 位置 |
 |---|---|
-| 会话日志（全部历史世代与压缩副本） | `$DSH_HOME/projects/<项目>/sessions/<id>/` |
+| 会话日志（全部历史世代与压缩副本） | `$DSH_HOME/sessions/--<项目slug>--/<会话id>/`（会话根由 profile 的 `session-persistence-jsonl` `root` 配置决定，默认安装即 `$DSH_HOME/sessions`） |
 | 投影缓存文档 | 存储域 `session_projcache`，表 `sessions` |
 | 工具大输出 spill 文件 | `<tmp>/dsh-spill-*/session-<hash>/` |
 | 工作树 worktree | 走官方回收：仅在干净且无其他引用时删除，**分支保留** |
@@ -91,7 +91,7 @@ bundle 补丁挂载一行。在 profile 的 `cordis.patch.yml` 覆盖其 `config
     retentionDays: 7                 # N 天后清理撤销快照元数据
     timeoutMs: 30000                 # 撤销快照的单条 git 命令超时
     outputMaxBytes: 8388608          # 撤销快照的 git 输出上限
-    dataRoot: ''                     # 撤销数据根；空 = ~/.dsh/session-undo
+    dataRoot: ''                     # 撤销数据根；空 = $DSH_HOME/session-undo（默认 ~/.dsh/session-undo）
     snapshotExcludes:                # 撤销快照排除的重目录
       - node_modules/
       - .git/
@@ -127,10 +127,12 @@ dsh plugin install <本目录的绝对路径>
 ## 开发
 
 ```sh
-node tests/host.test.mjs   # 删除/批量 + 路由/命令注册（13 项）
-node tests/undo.test.mjs   # 回退规划、真实 git/非 git 冲突感知还原（15 项）
-node tests/client.test.mjs # chat 可见性区间推导 + 隐藏（4 项）
+node tests/host.test.mjs   # 删除/批量 + 路由/命令注册（25 项）
+node tests/undo.test.mjs   # 回退规划、真实 git/非 git 冲突感知还原（21 项）
+node tests/client.test.mjs # chat 可见性区间推导 + 隐藏（10 项）
 ```
+
+`engines.dsh` 带上界（`<0.2.4`）：DSH 仅凭它判定兼容性，而私有 chat/行接缝只实测到该版本。实测更新的 DSH 版本后上调上界并重跑三套测试。此前设过 `DSH_HOME` 的安装，其撤销快照仍留在旧的 `~/.dsh/session-undo` 默认位置；把 `dataRoot` 指回那里即可继续使用。
 
 ## 致谢
 
