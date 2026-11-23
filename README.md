@@ -187,7 +187,7 @@ node tests/client.test.mjs    # chat-visibility cut derivation + hiding (10 test
 
 `node --test tests/` spawns a child process per file, which some sandboxes block; running the file directly keeps the run in-process.
 
-`engines.dsh` carries an upper bound (`<0.2.4`): DSH reads it alone for compatibility, and the private chat/row seams are only tested up to that release. After testing a newer DSH release, raise the bound and re-run the three suites. An installation that previously set `DSH_HOME` kept its undo store under the old `~/.dsh/session-undo` default; point `dataRoot` there to keep using those snapshots.
+`engines.dsh` carries an upper bound (`<0.3.0`): DSH reads it alone for compatibility. 0.2.x updates stay loadable — if a DSH change alters the private chat/row seams' shape, they degrade gracefully with a console warning and deletion is unaffected. The bound blocks the next minor (0.3.0), where breaking changes are most likely; after testing a newer DSH minor, raise the bound and re-run the three suites. An installation that previously set `DSH_HOME` kept its undo store under the old `~/.dsh/session-undo` default; point `dataRoot` there to keep using those snapshots.
 
 ## Credits
 

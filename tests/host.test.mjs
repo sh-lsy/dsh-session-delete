@@ -103,10 +103,12 @@ function snapshot(log, overrides = {}) {
 
 test('engines.dsh bounds compatibility to tested DSH releases', async () => {
   const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
-  // DSH reads engines.dsh alone for compatibility. An unbounded >= would claim
-  // support for every future release while the private chat/row seams are only
-  // tested up to the bound; raise it after testing a newer DSH (see README).
-  assert.equal(manifest.engines.dsh, '>=0.2.2-rc.3 <0.2.4')
+  // DSH reads engines.dsh alone for compatibility. The bound blocks the next
+  // minor (where breaking changes are most likely) while 0.2.x updates stay
+  // loadable: the private chat/row seams degrade gracefully with a console
+  // warning if their shape changes. Raise the bound after testing a newer
+  // DSH minor (see README), updating this assertion with it.
+  assert.equal(manifest.engines.dsh, '>=0.2.2-rc.3 <0.3.0')
 })
 
 test('resolveConfig validates every field and keeps the documented defaults', () => {
