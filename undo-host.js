@@ -15,7 +15,7 @@
  */
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { copyFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -386,7 +386,11 @@ export function mountUndo(ctx, config) {
   }), `session-undo: POST ${path}`)
 
   route(SNAPSHOTS_PATH, body => listSnapshots(snapshots, body))
-  route(PURGE_PATH, () => purge(ctx, config, snapshots, persist))
+  route(PURGE_PATH, async () => {
+    const purged = await purge(ctx, config, snapshots, persist)
+    const pruned = await pruneShadowObjects(ctx, config, await executable(), snapshots)
+    return { ok: true, data: { removed: purged.data.removed, repos: pruned.data.repos } }
+  })
   route(CLEAR_QUEUE_PATH, body => clearQueue(ctx, body))
   route(PREVIEW_PATH, body => previewRewind(ctx, config, executable, snapshots, body))
   route(CANDIDATES_PATH, body => listCandidates(ctx, body))
@@ -431,10 +435,16 @@ export function mountUndo(ctx, config) {
         changed = true
       }
     }
-    if (changed) await persist()
+    if (changed) {
+      await persist()
+      await pruneShadowObjects(ctx, config, await executable(), snapshots).catch(() => {})
+    }
   }
-  // Enforce the retention window once at mount (the owner purge route still works).
-  void loadPromise.then(() => purge(ctx, config, snapshots, persist)).catch(() => {})
+  // Enforce the retention window once at mount and reclaim the freed git objects.
+  void loadPromise.then(async () => {
+    await purge(ctx, config, snapshots, persist)
+    await pruneShadowObjects(ctx, config, await executable(), snapshots)
+  }).catch(() => {})
   return { forgetSession }
 }
 
@@ -708,6 +718,61 @@ export async function purge(ctx, config, snapshots, persist) {
   }
   if (removed > 0) await persist()
   return { ok: true, data: { removed } }
+}
+
+/**
+ * Reclaim shadow-git objects no retained snapshot references.
+ *
+ * Snapshot trees are written without refs, so they are unreachable by default and
+ * would accumulate forever. This anchors every retained tree under refs/snapshots/,
+ * drops refs whose tree is no longer retained, then prunes unreachable objects.
+ * Rebuilding refs from the live store first makes it safe for existing repos that
+ * have no refs yet. Orphaned repos (no retained records) are fully pruned.
+ */
+export async function pruneShadowObjects(ctx, config, exe, snapshots) {
+  if (exe === null || exe === undefined) return { ok: true, data: { repos: 0 } }
+  const snapshotRoot = join(dataRootOf(config), 'snapshot')
+  let dirs
+  try {
+    dirs = await readdir(snapshotRoot)
+  } catch {
+    return { ok: true, data: { repos: 0 } }
+  }
+  const byDir = new Map()
+  for (const record of snapshots.values()) {
+    if (record.cwd === undefined) continue
+    const dirName = storeName(record.cwd)
+    const trees = byDir.get(dirName) ?? new Set()
+    if (record.startTree) trees.add(record.startTree)
+    if (record.endTree) trees.add(record.endTree)
+    byDir.set(dirName, trees)
+  }
+  const signal = new AbortController().signal
+  let repos = 0
+  for (const dirName of dirs) {
+    const gitDir = join(snapshotRoot, dirName)
+    const retained = byDir.get(dirName) ?? new Set()
+    const env = { GIT_DIR: gitDir }
+    const opts = { cwd: gitDir, env, signal }
+    try {
+      for (const tree of retained) {
+        await runGit(ctx, config, exe, ['update-ref', `refs/snapshots/${tree}`, tree], opts)
+      }
+      const refs = await runGit(ctx, config, exe, ['for-each-ref', '--format=%(refname) %(objectname)', 'refs/snapshots/'], opts)
+      for (const line of refs.stdout.split('\n').filter(Boolean)) {
+        const space = line.indexOf(' ')
+        if (space < 0) continue
+        const refname = line.slice(0, space)
+        const oid = line.slice(space + 1)
+        if (!retained.has(oid)) await runGit(ctx, config, exe, ['update-ref', '-d', refname], opts)
+      }
+      await runGit(ctx, config, exe, ['gc', '--prune=now', '--quiet'], opts)
+      repos += 1
+    } catch (error) {
+      ctx.logger.warn(`session-undo: shadow gc failed for ${dirName}: ${String(error)}`)
+    }
+  }
+  return { ok: true, data: { repos } }
 }
 
 async function readJson(req) {

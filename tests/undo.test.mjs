@@ -14,7 +14,7 @@ import test from 'node:test'
 import { promisify } from 'node:util'
 
 import {
-  clearQueue, executeRewind, listCandidates, locateWorkspace, previewTurn, resolveRewind, resolveUndoConfig, revertTurn, snapshotTree, surfaceRangeBySeq, surfaceRewindRange, textOf, turnOfSeq,
+  clearQueue, executeRewind, listCandidates, locateWorkspace, previewTurn, pruneShadowObjects, resolveRewind, resolveUndoConfig, revertTurn, runGit, snapshotTree, surfaceRangeBySeq, surfaceRewindRange, textOf, turnOfSeq,
 } from '../undo-host.js'
 
 const execFileAsync = promisify(execFile)
@@ -362,4 +362,33 @@ test('executeRewind forces conversation-only for a mid-turn steering target even
   const result = await executeRewind(ctx, resolveUndoConfig({}), async () => 'git', snapshots, agent, 3, 'both', undefined)
   assert.equal(result.fileSnapshot, false)
   assert.deepEqual(result.reverted, [])
+})
+
+test('pruneShadowObjects keeps retained trees and prunes unretained ones', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-undo-'))
+  const data = await mkdtemp(join(tmpdir(), 'dsh-undo-data-'))
+  try {
+    await writeFile(join(dir, 'a.txt'), 'v1')
+    const { ctx, config, workspace, signal, snap } = await harness(dir, data)
+    const treeA = await snap()
+    await writeFile(join(dir, 'a.txt'), 'v2')
+    const treeB = await snap()
+    await writeFile(join(dir, 'a.txt'), 'v3')
+    const treeC = await snap() // not retained
+    const snapshots = new Map([
+      ['s#1', { sessionId: 's', turn: 1, startTree: treeA, endTree: treeB, cwd: dir, time: Date.now() }],
+    ])
+    await pruneShadowObjects(ctx, config, 'git', snapshots)
+    const exists = async (tree) => (await runGit(ctx, config, 'git', ['cat-file', '-e', tree], { cwd: workspace.root, env: workspace.env, signal })).exitCode === 0
+    assert.equal(await exists(treeA), true)
+    assert.equal(await exists(treeB), true)
+    assert.equal(await exists(treeC), false)
+    // a retained tree is still checkout-able after pruning
+    const co = await runGit(ctx, config, 'git', ['checkout', treeA, '--', 'a.txt'], { cwd: workspace.root, env: { ...workspace.env, GIT_INDEX_FILE: join(workspace.objects, 'co-index') }, signal })
+    assert.equal(co.exitCode, 0)
+    assert.equal(await readFile(join(dir, 'a.txt'), 'utf8'), 'v1')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    await rm(data, { recursive: true, force: true })
+  }
 })
