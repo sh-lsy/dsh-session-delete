@@ -313,13 +313,28 @@ const SESSION_DELETE_CSS = `
 .su-file-conflict .su-file-path { text-decoration: line-through; opacity: 0.7; }
 `
 
-/** Install the stylesheet once, directly into the document head. */
+/** Install the stylesheet once, directly into the document head; returns the node. */
 function injectStyles() {
-  if (document.getElementById(STYLE_ID) !== null) return
+  const existing = document.getElementById(STYLE_ID)
+  if (existing !== null) return existing
   const style = document.createElement('style')
   style.id = STYLE_ID
   style.textContent = SESSION_DELETE_CSS
   document.head.appendChild(style)
+  return style
+}
+
+/**
+ * Effect-scoped stylesheet: Modules does not clean up style nodes injected by
+ * earlier-preset bundles, so disposal removes the node explicitly — disabling
+ * or hot-replacing the plugin no longer leaves its styles until a page reload.
+ * A re-apply re-injects idempotently.
+ */
+function stylesEffect(ctx) {
+  ctx.effect(() => {
+    const style = injectStyles()
+    return () => { style?.remove() }
+  }, 'session-delete styles')
 }
 
 /** Minimal modal used when the design-system primitives are unavailable. */
@@ -1236,18 +1251,32 @@ function installChatViewVisibility(ctx) {
     currentCleanup?.(); currentCleanup = undefined
     if (ui?.views === undefined) return
     const views = ui.views
+    let warnedNoChat = false
     const ensure = () => {
       try {
         const definition = views.entries().find(candidate => candidate.target === 'chat')
-        if (definition === undefined || typeof definition.create !== 'function') return
+        if (definition === undefined || typeof definition.create !== 'function') {
+          if (!warnedNoChat) {
+            warnedNoChat = true
+            console.warn('session-undo: no chat view definition found; transcript hiding is unavailable (rewind still cuts the model context)')
+          }
+          return
+        }
         const current = patches.get(definition)
         const create = definition.create
         if (current !== undefined && create === current.wrapper) return
+        let degraded = false
         const wrapper = function wrappedChatBuilder() {
           const inner = create.call(definition)
           // Only wrap a builder whose protocol we understand; otherwise hand back
           // the original so a DSH builder change degrades instead of crashing.
-          if (inner === null || typeof inner !== 'object' || typeof inner.replace !== 'function' || typeof inner.apply !== 'function') return inner
+          if (inner === null || typeof inner !== 'object' || typeof inner.replace !== 'function' || typeof inner.apply !== 'function') {
+            if (!degraded) {
+              degraded = true
+              console.warn('session-undo: chat builder shape changed; transcript hiding degraded (rewind still cuts the model context)')
+            }
+            return inner
+          }
           return new RewindVisibilityBuilder(inner)
         }
         definition.create = wrapper
@@ -1261,13 +1290,15 @@ function installChatViewVisibility(ctx) {
     currentCleanup = () => { unsubscribe?.(); restorePatches(); rebuildOpenSessions(ui) }
   }
   const start = () => {
-    let scope
     if (typeof ctx.inject === 'function') {
-      scope = ctx.inject(['uiConversation'], (child) => installOn(child.get('uiConversation')))
+      // ctx.inject returns a Fiber, not a disposer: the child fiber is disposed
+      // with its parent plugin, so the cleanup below only unwinds our own
+      // patches. There is no manual scope disposal to perform here.
+      ctx.inject(['uiConversation'], (child) => installOn(child.get('uiConversation')))
     } else {
       installOn(ctx.get?.('uiConversation'))
     }
-    return () => { currentCleanup?.(); currentCleanup = undefined; if (typeof scope === 'function') scope() }
+    return () => { currentCleanup?.(); currentCleanup = undefined }
   }
   if (typeof ctx.effect === 'function') ctx.effect(start, 'session-undo chat visibility')
   else start()
@@ -1354,17 +1385,25 @@ function installRowAction(slots, render) {
     if (typeof slots.register !== 'function') return
     try { slots.register({ name: CHAT_NODE_SLOT, key: ROW_TICK_KEY }, () => null)() } catch { /* ignore */ }
   }
+  let warned = false
+  const warnOnce = (message) => { if (!warned) { warned = true; console.warn(message) } }
   const sync = () => {
     try {
       let changed = false
+      let eligible = 0
       for (const entry of slots.entries(CHAT_NODE_SLOT)) {
         const key = entry.options?.key
         if (key === undefined || !ROW_KEYS.has(key)) continue
         if ((entry.options?.priority ?? SHIPPED_ROW_PRIORITY) !== SHIPPED_ROW_PRIORITY) continue
+        eligible += 1
         changed = takeOver(entry) || changed
       }
+      // Make degradation visible instead of silent: a DSH upgrade that changes
+      // the row shape leaves no ↶, and the console says why.
+      if (eligible === 0) warnOnce('session-undo: no user/steering row entries found; the rewind action is unavailable')
+      else if (!changed && taken.size === 0) warnOnce('session-undo: row components could not be taken over (shape change); the rewind action is unavailable')
       if (changed) tick()
-    } catch { /* slot shape change: degrade to no ↶, never throw into apply */ }
+    } catch { warnOnce('session-undo: slot shape changed; the rewind action degraded') }
   }
   sync()
   let unsubscribe
@@ -1429,7 +1468,7 @@ function refillComposer(ctx, sessionId, text) {
 
 function apply(ctx) {
   try {
-    injectStyles()
+    stylesEffect(ctx)
     const t = ctx.locale.bind(NS)
     // Every language carries the English keys it does not translate, so `t`
     // never falls back to a raw key for a locale with a partial dictionary.
@@ -1594,5 +1633,5 @@ function apply(ctx) {
   }
 }
 
-module.exports = { name: 'session-delete', inject: ['contextMenus', 'slots', 'locale', 'sessions'], apply, __rewindTest: { rewindCutsOf, rewindTargetSeqOfArgs, RewindVisibilityBuilder, runUndo, latestRewindAnchor, chatNodesOf, isClassComponent, rowRendererOf } }
+module.exports = { name: 'session-delete', inject: ['contextMenus', 'slots', 'locale', 'sessions'], apply, __rewindTest: { rewindCutsOf, rewindTargetSeqOfArgs, RewindVisibilityBuilder, runUndo, latestRewindAnchor, chatNodesOf, isClassComponent, rowRendererOf, stylesEffect, installRowAction, installChatViewVisibility } }
 return module.exports; } });

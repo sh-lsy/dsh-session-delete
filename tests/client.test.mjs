@@ -11,7 +11,9 @@ import vm from 'node:vm'
 const source = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
 let captured
 const window = { __ModuleLoader__: { load: (definition) => { captured = definition } } }
-vm.runInContext(source, vm.createContext({ window, console }))
+// Keep the contextified sandbox so tests can inject a document/console mock.
+const sandbox = { window, console }
+vm.runInContext(source, vm.createContext(sandbox))
 const mockRequire = (name) => {
   if (name === 'react') {
     return {
@@ -133,4 +135,85 @@ test('rowRendererOf refuses class components so a DSH upgrade cannot crash the r
   // memo-wrapped class component is also refused.
   assert.equal(rowRendererOf({ type: ClassRow }), undefined)
   assert.equal(rowRendererOf({ type: FnRow }), FnRow)
+})
+
+test('stylesEffect removes the injected stylesheet on disposal and re-injects on re-apply', () => {
+  const { stylesEffect } = mod.__rewindTest
+  const nodes = new Map()
+  const doc = {
+    getElementById: (id) => nodes.get(id) ?? null,
+    createElement: () => ({ id: '', textContent: '', remove() { nodes.delete(this.id) } }),
+    head: { appendChild: (node) => { nodes.set(node.id, node) } },
+  }
+  sandbox.document = doc
+  try {
+    const disposers = []
+    const ctx = { effect: (fn) => { disposers.push(fn()); return () => {} } }
+    stylesEffect(ctx)
+    assert.equal(nodes.size, 1, 'stylesheet injected')
+    // Idempotent re-apply (HMR): the existing node is reused, not duplicated.
+    stylesEffect(ctx)
+    assert.equal(nodes.size, 1)
+    // Disposal removes the node so styles do not linger until a page reload.
+    for (const dispose of disposers) dispose()
+    assert.equal(nodes.size, 0, 'stylesheet removed on disposal')
+    stylesEffect(ctx)
+    assert.equal(nodes.size, 1, 're-apply re-injects')
+    for (const dispose of disposers) dispose()
+  } finally {
+    delete sandbox.document
+  }
+})
+
+test('chat visibility seam degrades visibly and cleans up with a fiber-like inject return', () => {
+  const { installChatViewVisibility } = mod.__rewindTest
+  const warnings = []
+  const realConsole = sandbox.console
+  sandbox.console = { warn: (...args) => warnings.push(args.join(' ')), error: () => {}, log: () => {} }
+  try {
+    // A builder missing `apply`: the wrapper must hand back the original and warn.
+    const definition = { target: 'chat', create: () => ({ replace: () => {} }) }
+    const views = { entries: () => [definition], subscribe: () => () => {} }
+    let cleanup
+    const ctx = {
+      effect: (fn) => { cleanup = fn(); return () => {} },
+      // ctx.inject returns a Fiber (object), never a disposer function.
+      inject: (_names, cb) => { cb({ get: () => ({ views }) }); return { dispose: () => {} } },
+      sessions: { list: { getSnapshot: () => ({ ids: [], byId: {} }) } },
+    }
+    installChatViewVisibility(ctx)
+    const built = definition.create()
+    assert.equal(typeof built.replace, 'function')
+    assert.equal(built.apply, undefined, 'unwrappable builder handed back unchanged')
+    assert.ok(warnings.some(w => w.includes('shape changed')), 'degradation is visible in the console')
+    // Cleanup must not depend on the inject return being callable.
+    cleanup()
+    assert.equal(typeof definition.create, 'function')
+  } finally {
+    sandbox.console = realConsole
+  }
+})
+
+test('row action seam warns once when rows cannot be taken over', () => {
+  const { installRowAction } = mod.__rewindTest
+  const warnings = []
+  const realConsole = sandbox.console
+  sandbox.console = { warn: (...args) => warnings.push(args.join(' ')), error: () => {}, log: () => {} }
+  try {
+    class ClassRow { render() { return null } }
+    ClassRow.prototype.isReactComponent = {}
+    const entry = { options: { key: 'user', priority: 0 }, component: ClassRow }
+    const slots = { entries: () => [entry], register: () => () => {}, subscribe: () => () => {} }
+    const cleanup = installRowAction(slots, () => null)
+    assert.equal(entry.component, ClassRow, 'class component row left untouched')
+    assert.ok(warnings.some(w => w.includes('rewind action')), 'degradation is visible in the console')
+    cleanup() // must not throw
+    // No eligible entries at all: a different, equally visible degradation.
+    const empty = { entries: () => [], register: () => () => {}, subscribe: () => () => {} }
+    const cleanup2 = installRowAction(empty, () => null)
+    assert.ok(warnings.some(w => w.includes('no user/steering row entries')))
+    cleanup2()
+  } finally {
+    sandbox.console = realConsole
+  }
 })
