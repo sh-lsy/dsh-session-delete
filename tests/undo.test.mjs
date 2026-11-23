@@ -14,7 +14,7 @@ import test from 'node:test'
 import { promisify } from 'node:util'
 
 import {
-  clearQueue, dataRootOf, executeRewind, listCandidates, locateWorkspace, mountUndo, previewTurn, pruneShadowObjects, resolveRewind, resolveUndoConfig, revertTurn, runGit, snapshotTree, surfaceRangeBySeq, surfaceRewindRange, textOf, turnOfSeq,
+  clearQueue, dataRootOf, executeRewind, listCandidates, locateWorkspace, messageContent, mountUndo, previewTurn, pruneShadowObjects, resolveRewind, resolveUndoConfig, revertTurn, runGit, snapshotTree, surfaceRangeBySeq, surfaceRewindRange, textOf, turnOfSeq,
 } from '../undo-host.js'
 
 const execFileAsync = promisify(execFile)
@@ -545,4 +545,74 @@ test('a turn recorded concurrently with mount-time shadow GC keeps its tree (ser
     await rm(dir, { recursive: true, force: true })
     await rm(data, { recursive: true, force: true })
   }
+})
+
+test('messageContent extracts text, image refs, and provider-derived file download urls', async () => {
+  const imageRef = { attachmentId: `sha256:${'a'.repeat(64)}`, mediaType: 'image/png', bytes: 3, width: 1, height: 1, name: 'pic.png' }
+  const fileRef = { attachmentId: `sha256:${'b'.repeat(64)}`, name: 'report.pdf', bytes: 4 }
+  const events = [
+    { seq: 1, type: 'user/message', data: { source: { kind: 'user' }, content: [
+      { type: 'text', text: 'look' },
+      { type: 'image', attachment: imageRef },
+      { type: 'file', attachment: fileRef },
+      { type: 'text', text: 'please' },
+    ] } },
+  ]
+  const session = { snapshotEvents: () => events }
+  const root = join(tmpdir(), 'attachments', 'v1')
+  const ctx = {
+    get: (name) => name === 'sessions'
+      ? { get: (id) => id === 's1' ? session : undefined }
+      : name === 'attachments'
+        ? { root, fileHostPath: (ref) => join(root, 'files', ref.attachmentId.slice(7, 9), ref.attachmentId.slice(7), ref.name) }
+        : undefined,
+  }
+  const result = await messageContent(ctx, { sessionId: 's1', seq: 1 })
+  assert.equal(result.ok, true)
+  assert.equal(result.data.text, 'look\nplease')
+  assert.deepEqual(result.data.images, [{ attachment: imageRef }])
+  assert.equal(result.data.files.length, 1)
+  assert.deepEqual(result.data.files[0].attachment, fileRef)
+  assert.equal(result.data.files[0].url, `/api/file?path=${encodeURIComponent(join(root, 'files', 'bb', 'b'.repeat(64), 'report.pdf'))}`)
+  assert.equal(result.data.omitted, 0)
+})
+
+test('messageContent refuses a non-user target and validates the body', async () => {
+  const events = [{ seq: 1, type: 'assistant/message', data: {} }]
+  const ctx = { get: () => ({ get: () => ({ snapshotEvents: () => events }) }) }
+  assert.equal((await messageContent(ctx, { sessionId: 's1', seq: 1 })).code, 'not-a-user-message')
+  assert.equal((await messageContent(ctx, { sessionId: 's1', seq: 9 })).code, 'not-a-user-message')
+  assert.equal((await messageContent(ctx, { sessionId: 's1' })).code, 'bad-request')
+  assert.equal((await messageContent(ctx, { seq: 1 })).code, 'bad-request')
+})
+
+test('messageContent reads a cold session through sessionQuery and disposes the observation', async () => {
+  let disposed = 0
+  const events = [{ seq: 2, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'cold' }] } }]
+  const ctx = {
+    get: () => undefined,
+    sessionQuery: { observeSession: async () => ({ events, [Symbol.dispose]: () => { disposed += 1 } }) },
+  }
+  const result = await messageContent(ctx, { sessionId: 'cold', seq: 2 })
+  assert.equal(result.ok, true)
+  assert.equal(result.data.text, 'cold')
+  assert.equal(disposed, 1)
+})
+
+test('messageContent omits file attachments whose host location cannot be verified', async () => {
+  const fileRef = { attachmentId: `sha256:${'c'.repeat(64)}`, name: 'x.bin', bytes: 1 }
+  const events = [{ seq: 1, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'file', attachment: fileRef }] } }]
+  const sessions = { get: () => ({ snapshotEvents: () => events }) }
+  // No attachments service: nothing can be located.
+  const r1 = await messageContent({ get: (name) => name === 'sessions' ? sessions : undefined }, { sessionId: 's1', seq: 1 })
+  assert.equal(r1.ok, true)
+  assert.equal(r1.data.files.length, 0)
+  assert.equal(r1.data.omitted, 1)
+  // A host path outside the attachment root is refused (containment guard).
+  const root = join(tmpdir(), 'attachments', 'v1')
+  const r2 = await messageContent({
+    get: (name) => name === 'sessions' ? sessions : { root, fileHostPath: () => join(tmpdir(), 'elsewhere', 'x.bin') },
+  }, { sessionId: 's1', seq: 1 })
+  assert.equal(r2.data.files.length, 0)
+  assert.equal(r2.data.omitted, 1)
 })

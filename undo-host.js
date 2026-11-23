@@ -17,13 +17,14 @@ import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { copyFile, mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join, resolve, sep } from 'node:path'
 
 const SNAPSHOTS_PATH = '/session-undo/snapshots'
 const PURGE_PATH = '/session-undo/purge'
 const CLEAR_QUEUE_PATH = '/session-undo/clear-queue'
 const PREVIEW_PATH = '/session-undo/preview'
 const CANDIDATES_PATH = '/session-undo/candidates'
+const MESSAGE_CONTENT_PATH = '/session-undo/message-content'
 const DAY_MS = 86_400_000
 const STDERR_TAIL_BYTES = 16 * 1024
 const TERMINATE_GRACE_MS = 2_000
@@ -416,6 +417,7 @@ export function mountUndo(ctx, config) {
   route(CLEAR_QUEUE_PATH, body => clearQueue(ctx, body))
   route(PREVIEW_PATH, body => previewRewind(ctx, config, executable, snapshots, body))
   route(CANDIDATES_PATH, body => listCandidates(ctx, body))
+  route(MESSAGE_CONTENT_PATH, body => messageContent(ctx, body))
 
   // The /rewind engine command: the client drives it with `@<seq> <mode>`; the
   // command node durably records the marker seq (outcome.sourceEventSeq) so the
@@ -743,6 +745,66 @@ export function listSnapshots(snapshots, body) {
     .sort((left, right) => right.turn - left.turn)
     .map(record => ({ turn: record.turn, time: record.time }))
   return { ok: true, data: { turns } }
+}
+
+/**
+ * Read one user message's full content for attachment-aware composer restore.
+ *
+ * The durable log keeps the withdrawn message, so its structured attachment
+ * references survive the rewind. Images travel as complete refs (the client
+ * reads their bytes through the session controller's readAttachment); files
+ * travel as refs plus an authenticated /api/file URL derived from the
+ * provider's own fileHostPath. A file whose host location cannot be verified
+ * (no host-file-backed store, or a path outside the attachment root) is
+ * omitted rather than guessed at — fail closed, like the delete-side GC gate.
+ * @param ctx - Host context.
+ * @param body - `{ sessionId, seq }` of the target user message.
+ * @returns `{ ok, data: { seq, text, images, files, omitted } }` or a refusal.
+ */
+export async function messageContent(ctx, body) {
+  const sessionId = body.sessionId
+  const seq = body.seq
+  if (typeof sessionId !== 'string' || !Number.isSafeInteger(seq)) {
+    return { ok: false, code: 'bad-request', message: 'sessionId and an integer seq are required' }
+  }
+  const live = ctx.get('sessions')?.get(sessionId)
+  let events
+  if (live !== undefined) {
+    events = live.snapshotEvents()
+  } else {
+    const observed = await ctx.sessionQuery.observeSession(sessionId)
+    try { events = observed.events } finally { observed[Symbol.dispose]?.() }
+  }
+  const event = events.find(entry => entry.seq === seq)
+  if (event === undefined || event.type !== 'user/message' || event.data?.source?.kind !== 'user') {
+    return { ok: false, code: 'not-a-user-message', message: 'the target is not a user message' }
+  }
+  const content = Array.isArray(event.data.content) ? event.data.content : []
+  const images = []
+  const files = []
+  let omitted = 0
+  const store = ctx.get('attachments')
+  for (const block of content) {
+    if (block?.type === 'image' && block.attachment?.attachmentId !== undefined) {
+      images.push({ attachment: block.attachment })
+    } else if (block?.type === 'file' && block.attachment?.attachmentId !== undefined) {
+      const url = fileDownloadUrl(store, block.attachment)
+      if (url === undefined) omitted += 1
+      else files.push({ attachment: block.attachment, url })
+    }
+  }
+  return { ok: true, data: { seq, text: textOf(content), images, files, omitted } }
+}
+
+/** The authenticated /api/file URL for one stored file object, or undefined when unverifiable. */
+function fileDownloadUrl(store, ref) {
+  const root = store?.root
+  if (typeof root !== 'string' || typeof store.fileHostPath !== 'function') return undefined
+  let hostPath
+  try { hostPath = store.fileHostPath(ref) } catch { return undefined }
+  if (typeof hostPath !== 'string') return undefined
+  if (hostPath !== root && !hostPath.startsWith(root + sep)) return undefined
+  return `/api/file?path=${encodeURIComponent(hostPath)}`
 }
 
 /** Drop snapshot metadata older than the retention window. */
