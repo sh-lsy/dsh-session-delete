@@ -224,26 +224,28 @@ test('restoreAttachments rebuilds files in order and binds them through the offi
   sandbox.Blob = Blob
   const created = []
   const added = []
+  const input = { addAttachments: (ids) => { added.push(ids); return true } }
   const conversation = {
     createDrafts: (sessionId, files, ordinary) => {
       created.push({ sessionId, files, ordinary })
       return files.map((file, index) => ({ id: `d${index}`, file }))
     },
     fileUploads: { getSnapshot: () => ({ d0: { status: 'ready' }, d1: { status: 'ready' } }) },
+    input: { for: () => input },
   }
-  const input = { addAttachments: (ids) => { added.push(ids); return true } }
   const ctx = {
-    get: (name) => name === 'conversation' ? conversation : name === 'uiConversation' ? { input: { for: () => input } } : undefined,
+    get: (name) => name === 'conversation' ? conversation : undefined,
     sessions: { scope: () => ({}) },
   }
   const face = {
-    readAttachment: async (ref) => ({ ok: true, value: { attachment: ref, data: Uint8Array.of(1, 2, 3) } }),
     getSnapshot: () => ({ subagent: null }),
   }
-  sandbox.fetch = async () => ({ ok: true, blob: async () => new Blob(['bytes'], { type: 'application/pdf' }) })
+  sandbox.fetch = async (url) => String(url).includes('objects')
+    ? { ok: true, blob: async () => new Blob(['img'], { type: 'application/octet-stream' }) }
+    : { ok: true, blob: async () => new Blob(['bytes'], { type: 'application/pdf' }) }
   try {
     const wanted = [
-      { kind: 'image', attachment: { attachmentId: 'sha256:x', mediaType: 'image/png', name: 'pic.png' } },
+      { kind: 'image', attachment: { attachmentId: 'sha256:x', mediaType: 'image/png', name: 'pic.png' }, url: '/api/file?path=%2Fattachments%2Fv1%2Fobjects%2Fxx' },
       { kind: 'file', attachment: { name: 'report.pdf' }, url: '/api/file?path=%2Fattachments%2Fv1%2Ffiles%2Fxx' },
     ]
     const result = await restoreAttachments(ctx, 's1', wanted, face)
@@ -252,6 +254,8 @@ test('restoreAttachments rebuilds files in order and binds them through the offi
     assert.equal(result.degraded, false)
     assert.equal(created[0].ordinary, true)
     assert.equal(created[0].files[0].name, 'pic.png')
+    // The ref's verified mediaType wins over the extensionless object's
+    // octet-stream response type.
     assert.equal(created[0].files[0].type, 'image/png')
     assert.equal(created[0].files[1].name, 'report.pdf')
     assert.equal(created[0].files[1].type, 'application/pdf')
@@ -287,30 +291,62 @@ test('refillComposer restores an attachment-only message (empty text)', async ()
   sandbox.setTimeout = setTimeout
   sandbox.clearTimeout = clearTimeout
   const added = []
+  const input = { addAttachments: (ids) => { added.push(ids); return true }, setDraft: () => {} }
   const conversation = {
     createDrafts: (_sessionId, files) => files.map((_file, index) => ({ id: `a${index}` })),
     fileUploads: { getSnapshot: () => ({ a0: { status: 'ready' } }) },
+    input: { for: () => input },
   }
-  const input = { addAttachments: (ids) => { added.push(ids); return true }, setDraft: () => {} }
   const ctx = {
-    get: (name) => name === 'conversation' ? conversation : { input: { for: () => input } },
+    get: (name) => name === 'conversation' ? conversation : undefined,
     sessions: { scope: () => ({}) },
   }
   const face = {
-    readAttachment: async (ref) => ({ ok: true, value: { attachment: ref, data: Uint8Array.of(1) } }),
     getSnapshot: () => ({ subagent: null }),
   }
+  sandbox.fetch = async () => ({ ok: true, blob: async () => new Blob(['img'], { type: 'application/octet-stream' }) })
   try {
-    const result = await refillComposer(ctx, 's1', '', { attachments: [{ kind: 'image', attachment: { mediaType: 'image/png', name: 'p.png' } }] }, face)
+    const result = await refillComposer(ctx, 's1', '', { attachments: [{ kind: 'image', attachment: { mediaType: 'image/png', name: 'p.png' }, url: '/api/file?path=%2Fattachments%2Fv1%2Fobjects%2Fxx' }] }, face)
     assert.equal(result.textOk, true)
     assert.equal(result.restored, 1)
     assert.equal(result.failed, 0)
     assert.deepEqual(plain(added[0]), ['a0'])
   } finally {
+    delete sandbox.fetch
     delete sandbox.File
     delete sandbox.Blob
     delete sandbox.setTimeout
     delete sandbox.clearTimeout
+  }
+})
+
+test('restoreAttachments falls back to the binding ctx when no scope is retained', async () => {
+  const { restoreAttachments } = mod.__rewindTest
+  sandbox.File = File
+  sandbox.Blob = Blob
+  const added = []
+  const input = { addAttachments: (ids) => { added.push(ids); return true } }
+  const conversation = {
+    createDrafts: (_sessionId, files) => files.map((_file, index) => ({ id: `b${index}` })),
+    fileUploads: { getSnapshot: () => ({ b0: { status: 'ready' } }) },
+    input: { for: (actx) => actx === scoped ? input : undefined },
+  }
+  const scoped = {}
+  const ctx = {
+    get: (name) => name === 'conversation' ? conversation : undefined,
+    // No retained scope: only the binding carries the agent context.
+    sessions: { scope: () => undefined, binding: () => ({ ctx: scoped }) },
+  }
+  sandbox.fetch = async () => ({ ok: true, blob: async () => new Blob(['x'], { type: 'text/markdown' }) })
+  try {
+    const result = await restoreAttachments(ctx, 's1', [{ kind: 'file', attachment: { name: 'a.md' }, url: '/api/file?path=x' }], { getSnapshot: () => ({ subagent: null }) })
+    assert.equal(result.restored, 1)
+    assert.equal(result.degraded, false)
+    assert.deepEqual(plain(added[0]), ['b0'])
+  } finally {
+    delete sandbox.fetch
+    delete sandbox.File
+    delete sandbox.Blob
   }
 })
 
@@ -324,18 +360,17 @@ test('runUndo fetches the withdrawn content and reports attachment restore count
   const chat = { nodes: { values: () => materialized } }
   const uiConversation = {
     binding: () => ({ target: () => ({ getSnapshot: () => chat }) }),
-    input: { for: () => ({ setDraft: () => {}, addAttachments: () => true }) },
   }
   const conversation = {
     createDrafts: (_sessionId, files) => files.map(() => ({ id: 'z0' })),
     fileUploads: { getSnapshot: () => ({ z0: { status: 'ready' } }) },
+    input: { for: () => ({ setDraft: () => {}, addAttachments: () => true }) },
   }
   const face = {
     command: async () => {
       materialized = [{ kind: 'command', anchorSeq: 10, data: { name: 'rewind', args: '@5 both', outcome: { kind: 'success', sourceEventSeq: 8, text: 'Rewound' } } }]
       return { ok: true }
     },
-    readAttachment: async (ref) => ({ ok: true, value: { attachment: ref, data: Uint8Array.of(1) } }),
     getSnapshot: () => ({ subagent: null }),
   }
   const ctx = {
@@ -346,7 +381,7 @@ test('runUndo fetches the withdrawn content and reports attachment restore count
     if (String(url).includes('message-content')) {
       return {
         ok: true,
-        text: async () => JSON.stringify({ ok: true, data: { seq: 5, text: 'prompt', attachments: [{ kind: 'image', attachment: { mediaType: 'image/png', name: 'p.png' } }], omitted: 0 } }),
+        text: async () => JSON.stringify({ ok: true, data: { seq: 5, text: 'prompt', attachments: [{ kind: 'image', attachment: { mediaType: 'image/png', name: 'p.png' }, url: '/api/file?path=%2Fattachments%2Fv1%2Fobjects%2Fxx' }], omitted: 0 } }),
       }
     }
     return { ok: true, blob: async () => new Blob(['x']) }

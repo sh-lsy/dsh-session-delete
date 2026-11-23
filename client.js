@@ -820,6 +820,7 @@ const UNDO_DICT = {
     'dialog.doneTitle': '已回退',
     'dialog.doneDesc': '已回退，提示词已放回输入框',
     'dialog.attachmentsRestored': '已恢复 {n} 个附件到输入框',
+    'dialog.filesReverted': '还原 {n} 个文件，跳过 {m} 个冲突',
     'dialog.attachmentsFailed': '部分附件未能自动恢复，请手动重新添加',
     'dialog.prefillFailed': '提示词未能自动填入输入框，请手动输入',
     'dialog.failed': '回退失败：',
@@ -859,6 +860,7 @@ const UNDO_DICT = {
     'dialog.doneTitle': 'Rewound',
     'dialog.doneDesc': 'Rewound; the prompt is restored to the composer',
     'dialog.attachmentsRestored': 'Restored {n} attachment(s) to the composer',
+    'dialog.filesReverted': 'Reverted {n} file(s), skipped {m} conflict(s)',
     'dialog.attachmentsFailed': 'Some attachments could not be restored automatically; please add them again manually',
     'dialog.prefillFailed': 'The prompt could not be auto-filled into the composer; please type it manually',
     'dialog.failed': 'Rewind failed: ',
@@ -957,6 +959,7 @@ async function runUndo(ctx, request, mode) {
   // fallback when the route is unavailable.
   let content = null
   try { content = await post('/session-undo/message-content', { sessionId, seq }) } catch { content = null }
+  if (content?.ok !== true) console.warn('session-undo: message-content route unavailable; restoring text only', content?.code ?? content?.message ?? 'no response')
   const full = content?.ok === true ? content.data : null
   const prefill = await refillComposer(ctx, sessionId, full?.text ?? text, full, face)
   return {
@@ -966,6 +969,7 @@ async function runUndo(ctx, request, mode) {
     attachmentsRestored: prefill.restored,
     attachmentsFailed: prefill.failed,
     attachmentsDegraded: prefill.degraded,
+    attachmentsDetail: prefill.detail ?? '',
   }
 }
 
@@ -993,6 +997,7 @@ function UndoDialog(props) {
         attachmentsRestored: result.attachmentsRestored ?? 0,
         attachmentsFailed: result.attachmentsFailed ?? 0,
         attachmentsDegraded: result.attachmentsDegraded === true,
+        attachmentsDetail: result.attachmentsDetail ?? '',
       }
       : { kind: 'error', code: result?.code, message: result?.message })
   }
@@ -1021,9 +1026,17 @@ function UndoDialog(props) {
   if (phase.kind === 'done') {
     children.push(React.createElement('div', { key: 'done-title', className: 'su-text', style: { fontWeight: 500, color: 'var(--dsw-alias-label-primary)' } }, t2('dialog.doneTitle')))
     children.push(React.createElement('div', { key: 'done-desc', className: 'su-text' }, t2('dialog.doneDesc')))
-    if (phase.summary) children.push(React.createElement('div', { key: 'done-summary', className: 'su-text' }, phase.summary))
+    if (phase.summary) {
+      // Surface file-revert results only when something happened; the raw
+      // command text ("Rewound to message @N. Reverted 0 file(s)...") is noise.
+      const match = /Reverted (\d+) file\(s\), skipped (\d+) conflict\(s\)/.exec(phase.summary)
+      if (match !== null && (Number(match[1]) > 0 || Number(match[2]) > 0)) {
+        children.push(React.createElement('div', { key: 'done-files', className: 'su-text' },
+          t2('dialog.filesReverted').replace('{n}', match[1]).replace('{m}', match[2])))
+      }
+    }
     if (phase.attachmentsRestored > 0) children.push(React.createElement('div', { key: 'done-attachments', className: 'su-text' }, t2('dialog.attachmentsRestored').replace('{n}', String(phase.attachmentsRestored))))
-    if (phase.attachmentsFailed > 0 || phase.attachmentsDegraded) children.push(React.createElement('div', { key: 'done-attachments-failed', className: 'su-error' }, t2('dialog.attachmentsFailed')))
+    if (phase.attachmentsFailed > 0 || phase.attachmentsDegraded) children.push(React.createElement('div', { key: 'done-attachments-failed', className: 'su-error' }, t2('dialog.attachmentsFailed') + (phase.attachmentsDetail ? ` [${phase.attachmentsDetail}]` : '')))
     if (!phase.prefillOk) children.push(React.createElement('div', { key: 'done-prefill', className: 'su-error' }, t2('dialog.prefillFailed')))
   } else if (phase.kind === 'select') {
     const steering = request?.kind === 'steering'
@@ -1412,6 +1425,7 @@ function installRowAction(slots, render) {
     try { slots.register({ name: CHAT_NODE_SLOT, key: ROW_TICK_KEY }, () => null)() } catch { /* ignore */ }
   }
   let warned = false
+  let recheckArmed = false
   const warnOnce = (message) => { if (!warned) { warned = true; console.warn(message) } }
   const sync = () => {
     try {
@@ -1425,9 +1439,23 @@ function installRowAction(slots, render) {
         changed = takeOver(entry) || changed
       }
       // Make degradation visible instead of silent: a DSH upgrade that changes
-      // the row shape leaves no ↶, and the console says why.
-      if (eligible === 0) warnOnce('session-undo: no user/steering row entries found; the rewind action is unavailable')
-      else if (!changed && taken.size === 0) warnOnce('session-undo: row components could not be taken over (shape change); the rewind action is unavailable')
+      // the row shape leaves no ↶, and the console says why. An empty first
+      // sync is usually the startup race (we load before the chat rows
+      // register), so recheck once after things settle before declaring it.
+      if (eligible === 0) {
+        if (typeof setTimeout !== 'function') {
+          warnOnce('session-undo: no user/steering row entries found; the rewind action is unavailable')
+        } else if (!recheckArmed) {
+          recheckArmed = true
+          const timer = setTimeout(() => {
+            try {
+              const late = [...slots.entries(CHAT_NODE_SLOT)].some(entry => ROW_KEYS.has(entry.options?.key) && (entry.options?.priority ?? SHIPPED_ROW_PRIORITY) === SHIPPED_ROW_PRIORITY)
+              if (!late) warnOnce('session-undo: no user/steering row entries found; the rewind action is unavailable')
+            } catch { /* ignore */ }
+          }, 3000)
+          timer?.unref?.()
+        }
+      } else if (!changed && taken.size === 0) warnOnce('session-undo: row components could not be taken over (shape change); the rewind action is unavailable')
       if (changed) tick()
     } catch { warnOnce('session-undo: slot shape changed; the rewind action degraded') }
   }
@@ -1456,6 +1484,27 @@ function UserRewindAction(props) {
   }, React.createElement(UndoIcon))
 }
 
+// Service reference captured via inject (the access path proven to work in
+// this plugin's chat-visibility seam), preferred over plain ctx.get at
+// restore time.
+let conversationServiceRef
+
+/** The session's agent-scoped context: the retained scope, falling back to the
+ * binding's own ctx (scope() only answers while a generation is retained). */
+function sessionScopeOf(ctx, sessionId) {
+  return ctx.sessions.scope?.(sessionId) ?? ctx.sessions.binding?.(sessionId)?.ctx
+}
+
+/** The per-session input facade. The resolver lives on the `conversation`
+ * service (ConversationController.input), NOT on uiConversation — the latter
+ * owns registries/bindings/images only. */
+function inputFaceOf(ctx, sessionId) {
+  const actx = sessionScopeOf(ctx, sessionId)
+  if (actx === undefined) return undefined
+  const conversation = conversationServiceRef ?? ctx.get('conversation')
+  return conversation?.input?.for(actx)
+}
+
 /** Restore the withdrawn prompt to the composer: text via the facade setDraft
  * (then DOM fallback), attachments via the official conversation intake. An
  * attachment-only message (empty text) still restores its attachments. Returns
@@ -1467,18 +1516,18 @@ function refillComposer(ctx, sessionId, text, content, face) {
     const finish = (value) => { if (!settled) { settled = true; resolve(value) } }
     const withAttachments = (textOk) => {
       restoreAttachments(ctx, sessionId, wanted, face)
-        .then(({ restored, failed, degraded }) => {
+        .then(({ restored, failed, degraded, detail }) => {
           // An empty-text message counts as prefilled only when something landed.
-          finish({ textOk: text === '' ? restored > 0 : textOk, restored, failed, degraded })
+          finish({ textOk: text === '' ? restored > 0 : textOk, restored, failed, degraded, detail: detail ?? '' })
         })
-        .catch(() => finish({ textOk: false, restored: 0, failed: wanted.length, degraded: true }))
+        .catch((error) => finish({ textOk: false, restored: 0, failed: wanted.length, degraded: true, detail: `restore error: ${error?.message ?? error}` }))
     }
     if (text === '') { withAttachments(true); return }
     let tries = 0
     const write = () => {
-      const actx = ctx.sessions.scope?.(sessionId)
-      if (actx !== undefined) {
-        try { ctx.get('uiConversation')?.input.for(actx).setDraft(text); return true } catch { /* fall through to DOM */ }
+      const input = inputFaceOf(ctx, sessionId)
+      if (input !== undefined) {
+        try { input.setDraft(text); return true } catch { /* fall through to DOM */ }
       }
       const editable = document.querySelector('[data-composer-input]')
       if (editable === null) return false
@@ -1508,38 +1557,44 @@ function refillComposer(ctx, sessionId, text, content, face) {
  * Re-materialize the withdrawn message's attachments into the composer draft
  * through the official intake: conversation.createDrafts registers browser
  * Files (uploads start immediately), input.addAttachments binds them to the
- * draft. Images read their bytes via the session controller's readAttachment;
- * files fetch the authenticated /api/file URL the Host derived. Any missing
- * API degrades the whole attachment arm with a visible warning; per-item
- * failures are counted and never block the remaining items.
+ * draft. Bytes fetch uniformly from the authenticated /api/file URLs the Host
+ * derived from the provider's own hostPath (images carry their mediaType in
+ * the ref, so the File MIME does not depend on the object's extensionless
+ * name). Any missing intake API degrades the whole attachment arm with a
+ * visible warning naming the gap; per-item failures are counted and never
+ * block the remaining items.
  */
 async function restoreAttachments(ctx, sessionId, wanted, face) {
-  if (wanted.length === 0) return { restored: 0, failed: 0, degraded: false }
-  const conversation = ctx.get('conversation')
-  const actx = ctx.sessions.scope?.(sessionId)
-  const input = actx !== undefined ? ctx.get('uiConversation')?.input?.for(actx) : undefined
-  if (typeof conversation?.createDrafts !== 'function' || typeof input?.addAttachments !== 'function' || typeof face?.readAttachment !== 'function') {
-    console.warn('session-undo: composer attachment APIs unavailable; attachments were not restored')
-    return { restored: 0, failed: wanted.length, degraded: true }
+  if (wanted.length === 0) return { restored: 0, failed: 0, degraded: false, detail: '' }
+  const conversation = conversationServiceRef ?? ctx.get('conversation')
+  const input = inputFaceOf(ctx, sessionId)
+  const missing = [
+    typeof conversation?.createDrafts !== 'function' ? 'conversation.createDrafts' : null,
+    typeof input?.addAttachments !== 'function' ? 'input.addAttachments' : null,
+  ].filter(Boolean)
+  if (missing.length > 0) {
+    console.warn(`session-undo: composer attachment APIs unavailable (${missing.join(', ')}); attachments were not restored`)
+    return { restored: 0, failed: wanted.length, degraded: true, detail: missing.join(', ') }
   }
   const files = []
   let failed = 0
+  let fetchDetail = ''
   for (const item of wanted) {
     try {
-      if (item.kind === 'image') {
-        const result = await face.readAttachment(item.attachment)
-        if (result?.ok !== true) { failed += 1; continue }
-        const ref = result.value.attachment
-        files.push(new File([result.value.data], ref.name ?? 'image', { type: ref.mediaType }))
-      } else {
-        const response = await fetch(item.url)
-        if (!response.ok) { failed += 1; continue }
-        const blob = await response.blob()
-        files.push(new File([blob], item.attachment?.name ?? 'file', { type: blob.type || 'application/octet-stream' }))
-      }
-    } catch { failed += 1 }
+      if (typeof item.url !== 'string') { failed += 1; fetchDetail ||= 'no url'; continue }
+      const response = await fetch(item.url)
+      if (!response.ok) { failed += 1; fetchDetail ||= `fetch ${response.status}`; continue }
+      const blob = await response.blob()
+      // Image objects are extensionless, so /api/file serves them as
+      // octet-stream; the ref's verified mediaType is the authoritative MIME.
+      const mediaType = item.kind === 'image'
+        ? (item.attachment?.mediaType || blob.type || 'application/octet-stream')
+        : (blob.type || 'application/octet-stream')
+      const name = item.attachment?.name ?? (item.kind === 'image' ? 'image' : 'file')
+      files.push(new File([blob], name, { type: mediaType }))
+    } catch (error) { failed += 1; fetchDetail ||= `fetch error: ${error?.message ?? error}` }
   }
-  if (files.length === 0) return { restored: 0, failed, degraded: false }
+  if (files.length === 0) return { restored: 0, failed, degraded: false, detail: fetchDetail || 'no bytes' }
   let ordinary = true
   try { ordinary = face.getSnapshot().subagent === null } catch { /* ordinary default */ }
   let drafts
@@ -1547,7 +1602,7 @@ async function restoreAttachments(ctx, sessionId, wanted, face) {
     drafts = conversation.createDrafts(sessionId, files, ordinary)
   } catch (error) {
     console.warn('session-undo: draft creation failed; attachments were not restored', error)
-    return { restored: 0, failed: failed + files.length, degraded: true }
+    return { restored: 0, failed: failed + files.length, degraded: true, detail: `createDrafts: ${error?.message ?? error}` }
   }
   const ids = drafts.map(draft => draft.id)
   let added = input.addAttachments(ids)
@@ -1558,7 +1613,7 @@ async function restoreAttachments(ctx, sessionId, wanted, face) {
   }
   if (added !== true) {
     try { conversation.releaseDraftAttachments?.(drafts) } catch { /* ignore */ }
-    return { restored: 0, failed: failed + files.length, degraded: false }
+    return { restored: 0, failed: failed + files.length, degraded: false, detail: 'addAttachments refused' }
   }
   // Bounded wait for the background uploads; the composer guards send itself,
   // so a timeout here only affects the reported count, not correctness.
@@ -1573,7 +1628,7 @@ async function restoreAttachments(ctx, sessionId, wanted, face) {
     }
     errored = ids.filter((id) => state[id]?.status === 'error').length
   }
-  return { restored: ids.length - errored, failed: failed + errored, degraded: false }
+  return { restored: ids.length - errored, failed: failed + errored, degraded: false, detail: errored > 0 ? `upload errors (${errored})` : '' }
 }
 
 function apply(ctx) {
@@ -1672,6 +1727,13 @@ function apply(ctx) {
     }
     const undoRequest = createSource(null)
 
+    // Capture the composer service through inject — the same access pattern
+    // the chat-visibility seam uses successfully — so restore does not depend
+    // on plain ctx.get visibility across plugin fibers.
+    try {
+      ctx.inject(['conversation'], (child) => { conversationServiceRef = child.get('conversation') })
+    } catch { /* fall back to ctx.get at restore time */ }
+
     // ↶ on each user/steering message row (opencode-style). The row supplies the
     // target seq and prompt text directly; clicking opens the confirm dialog.
     ctx.effect(() => installRowAction(ctx.slots, (row) => React.createElement(UserRewindAction, {
@@ -1743,5 +1805,5 @@ function apply(ctx) {
   }
 }
 
-module.exports = { name: 'session-delete', inject: ['contextMenus', 'slots', 'locale', 'sessions'], apply, __rewindTest: { rewindCutsOf, rewindTargetSeqOfArgs, RewindVisibilityBuilder, runUndo, latestRewindAnchor, chatNodesOf, isClassComponent, rowRendererOf, stylesEffect, installRowAction, installChatViewVisibility, refillComposer, restoreAttachments } }
+module.exports = { name: 'session-delete', inject: ['contextMenus', 'slots', 'locale', 'sessions', 'conversation'], apply, __rewindTest: { rewindCutsOf, rewindTargetSeqOfArgs, RewindVisibilityBuilder, runUndo, latestRewindAnchor, chatNodesOf, isClassComponent, rowRendererOf, stylesEffect, installRowAction, installChatViewVisibility, refillComposer, restoreAttachments } }
 return module.exports; } });

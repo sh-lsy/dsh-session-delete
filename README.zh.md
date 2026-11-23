@@ -129,7 +129,7 @@ dsh plugin install <本目录的绝对路径>
 ```sh
 node tests/host.test.mjs   # 删除/批量 + 路由/命令注册（25 项）
 node tests/undo.test.mjs   # 回退规划、真实 git/非 git 冲突感知还原（25 项）
-node tests/client.test.mjs # chat 可见性区间推导 + 隐藏（14 项）
+node tests/client.test.mjs # chat 可见性区间推导 + 隐藏（15 项）
 ```
 
 `engines.dsh` 带上界（`<0.3.0`）：DSH 仅凭它判定兼容性。0.2.x 更新仍可加载——若 DSH 变更改变了私有 chat/行接缝的形状，接缝优雅降级并输出控制台警告，删除功能不受影响。上界挡住下一个 minor（0.3.0，破坏性变更最可能处）；实测更新的 DSH minor 后上调上界并重跑三套测试。此前设过 `DSH_HOME` 的安装，其撤销快照仍留在旧的 `~/.dsh/session-undo` 默认位置；把 `dataRoot` 指回那里即可继续使用。

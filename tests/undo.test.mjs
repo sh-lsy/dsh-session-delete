@@ -560,19 +560,25 @@ test('messageContent extracts text, image refs, and provider-derived file downlo
   ]
   const session = { snapshotEvents: () => events }
   const root = join(tmpdir(), 'attachments', 'v1')
+  const digest = (ref) => ref.attachmentId.slice(7)
   const ctx = {
     get: (name) => name === 'sessions'
       ? { get: (id) => id === 's1' ? session : undefined }
       : name === 'attachments'
-        ? { root, fileHostPath: (ref) => join(root, 'files', ref.attachmentId.slice(7, 9), ref.attachmentId.slice(7), ref.name) }
+        ? {
+          root,
+          imageHostPath: (ref) => join(root, 'objects', digest(ref).slice(0, 2), digest(ref)),
+          fileHostPath: (ref) => join(root, 'files', digest(ref).slice(0, 2), digest(ref), ref.name),
+        }
         : undefined,
   }
   const result = await messageContent(ctx, { sessionId: 's1', seq: 1 })
   assert.equal(result.ok, true)
   assert.equal(result.data.text, 'look\nplease')
-  // Attachments keep the message's original interleaved order.
+  // Attachments keep the message's original interleaved order; both kinds
+  // carry provider-derived /api/file URLs.
   assert.deepEqual(result.data.attachments, [
-    { kind: 'image', attachment: imageRef },
+    { kind: 'image', attachment: imageRef, url: `/api/file?path=${encodeURIComponent(join(root, 'objects', 'aa', 'a'.repeat(64)))}` },
     { kind: 'file', attachment: fileRef, url: `/api/file?path=${encodeURIComponent(join(root, 'files', 'bb', 'b'.repeat(64), 'report.pdf'))}` },
   ])
   assert.equal(result.data.omitted, 0)

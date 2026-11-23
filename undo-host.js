@@ -751,13 +751,13 @@ export function listSnapshots(snapshots, body) {
  * Read one user message's full content for attachment-aware composer restore.
  *
  * The durable log keeps the withdrawn message, so its structured attachment
- * references survive the rewind. Images travel as complete refs (the client
- * reads their bytes through the session controller's readAttachment); files
- * travel as refs plus an authenticated /api/file URL derived from the
- * provider's own fileHostPath. Attachments keep the message's original order.
- * A file whose host location cannot be verified (no host-file-backed store,
- * or a path outside the attachment root) is omitted rather than guessed at —
- * fail closed, like the delete-side GC gate.
+ * references survive the rewind. Every attachment travels as its complete ref
+ * plus an authenticated /api/file URL derived from the provider's own
+ * imageHostPath / fileHostPath, so the client fetches bytes uniformly without
+ * needing the session controller's image read API. Attachments keep the
+ * message's original order. An attachment whose host location cannot be
+ * verified (no host-file-backed store, or a path outside the attachment root)
+ * is omitted rather than guessed at — fail closed, like the delete-side GC gate.
  * @param ctx - Host context.
  * @param body - `{ sessionId, seq }` of the target user message.
  * @returns `{ ok, data: { seq, text, attachments, omitted } }` or a refusal.
@@ -785,23 +785,23 @@ export async function messageContent(ctx, body) {
   let omitted = 0
   const store = ctx.get('attachments')
   for (const block of content) {
-    if (block?.type === 'image' && block.attachment?.attachmentId !== undefined) {
-      attachments.push({ kind: 'image', attachment: block.attachment })
-    } else if (block?.type === 'file' && block.attachment?.attachmentId !== undefined) {
-      const url = fileDownloadUrl(store, block.attachment)
-      if (url === undefined) omitted += 1
-      else attachments.push({ kind: 'file', attachment: block.attachment, url })
-    }
+    if (block?.type !== 'image' && block?.type !== 'file') continue
+    if (block.attachment?.attachmentId === undefined) continue
+    const url = attachmentDownloadUrl(store, block.attachment, block.type)
+    if (url === undefined) omitted += 1
+    else attachments.push({ kind: block.type, attachment: block.attachment, url })
   }
   return { ok: true, data: { seq, text: textOf(content), attachments, omitted } }
 }
 
-/** The authenticated /api/file URL for one stored file object, or undefined when unverifiable. */
-function fileDownloadUrl(store, ref) {
+/** The authenticated /api/file URL for one stored attachment object, or undefined when unverifiable. */
+function attachmentDownloadUrl(store, ref, kind) {
   const root = store?.root
-  if (typeof root !== 'string' || typeof store.fileHostPath !== 'function') return undefined
+  if (typeof root !== 'string') return undefined
+  const hostPathOf = kind === 'image' ? store.imageHostPath : store.fileHostPath
+  if (typeof hostPathOf !== 'function') return undefined
   let hostPath
-  try { hostPath = store.fileHostPath(ref) } catch { return undefined }
+  try { hostPath = hostPathOf.call(store, ref) } catch { return undefined }
   if (typeof hostPath !== 'string') return undefined
   if (hostPath !== root && !hostPath.startsWith(root + sep)) return undefined
   return `/api/file?path=${encodeURIComponent(hostPath)}`

@@ -182,7 +182,7 @@ The Web half (`client.js`) is a hand-written Client bundle in the `__ModuleLoade
 ```sh
 node tests/host.test.mjs      # delete / batch + route/command registration (25 tests)
 node tests/undo.test.mjs      # rewind planning, real git/non-git conflict-aware restore (25 tests)
-node tests/client.test.mjs    # chat-visibility cut derivation + hiding (14 tests)
+node tests/client.test.mjs    # chat-visibility cut derivation + hiding (15 tests)
 ```
 
 `node --test tests/` spawns a child process per file, which some sandboxes block; running the file directly keeps the run in-process.
