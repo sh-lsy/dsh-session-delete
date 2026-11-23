@@ -173,7 +173,7 @@ The Web half (`client.js`) is a hand-written Client bundle in the `__ModuleLoade
 - A live Session's in-memory object stays attached after deletion (Harness has no public eviction API). It is archived, so it runs no further turn and appends nothing; the sidebar row is removed on refresh. The orphan is released when the process exits.
 - A deleted Session's id stays in the Workspace registry's in-memory header index until the next start; the row is removed immediately and the stale index entry is unreachable from the UI.
 - Lineage: deleting a Session that other Sessions forked from leaves their `parentSession` pointing at nothing. The dialog warns with the child count; only the displayed lineage is affected.
-- Rewind snapshots start at install/restart; earlier turns have none (file restore falls back to conversation-only). Snapshots auto-purge after `retentionDays` (metadata **and** the shadow-git objects via `git gc`), and are forgotten when a session is deleted. A nested git directory (gitlink) cannot be reverted file-by-file and is skipped as a conflict. Rewind cuts the model context via a surface replacement and hides the transcript client-side (same session; the durable log keeps the withdrawn turns). Only the turn's own changes are reverted; files modified afterward are skipped. A message already shadowed by compaction cannot be rewound to; steering targets support conversation-only rewind.
+- Rewind snapshots start at install/restart; earlier turns have none (file restore falls back to conversation-only). Snapshots auto-purge after `retentionDays` (metadata **and** the shadow-git objects via `git gc`), and are forgotten when a session is deleted. A nested git directory (gitlink) cannot be reverted file-by-file and is skipped as a conflict. Rewind cuts the model context via a surface replacement and hides the transcript client-side (same session; the durable log keeps the withdrawn turns). Only the turn's own changes are reverted; files modified afterward are skipped. A message already shadowed by compaction cannot be rewound to; steering targets support conversation-only rewind. Rewinding a message with attachments restores its text **and** its attachments to the composer, opencode-style (images read through the session's attachment API, files through the authenticated file route; an attachment-only message restores too). Files above the 50 MiB display limit, or any unavailable attachment API, degrade to a visible notice instead of failing the rewind.
 - Legacy `[rewound]` markers written by the old prepare path have no command node, so their withdrawn rows may reappear after upgrade (the model context is still cut); new rewinds use command nodes and stay hidden across reloads.
 - The ↶ action mounts on the user/steering message row by taking over the shipped row component (a private seam, shape-checked and restored on unload); the transcript-hiding wraps the chat view builder (also private). Both degrade gracefully if a DSH upgrade changes their shape.
 
@@ -181,8 +181,8 @@ The Web half (`client.js`) is a hand-written Client bundle in the `__ModuleLoade
 
 ```sh
 node tests/host.test.mjs      # delete / batch + route/command registration (25 tests)
-node tests/undo.test.mjs      # rewind planning, real git/non-git conflict-aware restore (21 tests)
-node tests/client.test.mjs    # chat-visibility cut derivation + hiding (10 tests)
+node tests/undo.test.mjs      # rewind planning, real git/non-git conflict-aware restore (25 tests)
+node tests/client.test.mjs    # chat-visibility cut derivation + hiding (14 tests)
 ```
 
 `node --test tests/` spawns a child process per file, which some sandboxes block; running the file directly keeps the run in-process.

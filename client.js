@@ -819,6 +819,8 @@ const UNDO_DICT = {
     'dialog.done': '完成',
     'dialog.doneTitle': '已回退',
     'dialog.doneDesc': '已回退，提示词已放回输入框',
+    'dialog.attachmentsRestored': '已恢复 {n} 个附件到输入框',
+    'dialog.attachmentsFailed': '部分附件未能自动恢复，请手动重新添加',
     'dialog.prefillFailed': '提示词未能自动填入输入框，请手动输入',
     'dialog.failed': '回退失败：',
     'reason.session-busy': '该会话正在运行轮次且无法停止，请先停止再回退',
@@ -856,6 +858,8 @@ const UNDO_DICT = {
     'dialog.done': 'Done',
     'dialog.doneTitle': 'Rewound',
     'dialog.doneDesc': 'Rewound; the prompt is restored to the composer',
+    'dialog.attachmentsRestored': 'Restored {n} attachment(s) to the composer',
+    'dialog.attachmentsFailed': 'Some attachments could not be restored automatically; please add them again manually',
     'dialog.prefillFailed': 'The prompt could not be auto-filled into the composer; please type it manually',
     'dialog.failed': 'Rewind failed: ',
     'reason.session-busy': 'The session is running a turn and could not be stopped; stop it before rewinding',
@@ -948,8 +952,21 @@ async function runUndo(ctx, request, mode) {
   const outcome = await waitForRewindOutcome(ctx, sessionId, beforeSeq)
   if (outcome === undefined) return { ok: false, code: 'no-outcome', message: '无法确认回退结果，请查看会话中的命令输出' }
   if (outcome.kind !== 'success') return { ok: false, code: 'rewind-error', message: outcome.text ?? '回退失败' }
-  const prefillOk = await refillComposer(ctx, sessionId, text)
-  return { ok: true, prefillOk, summary: outcome.text ?? '' }
+  // Fetch the withdrawn message's full content (text + ordered attachment refs)
+  // so the composer restore is complete, opencode-style; the row text is the
+  // fallback when the route is unavailable.
+  let content = null
+  try { content = await post('/session-undo/message-content', { sessionId, seq }) } catch { content = null }
+  const full = content?.ok === true ? content.data : null
+  const prefill = await refillComposer(ctx, sessionId, full?.text ?? text, full, face)
+  return {
+    ok: true,
+    prefillOk: prefill.textOk,
+    summary: outcome.text ?? '',
+    attachmentsRestored: prefill.restored,
+    attachmentsFailed: prefill.failed,
+    attachmentsDegraded: prefill.degraded,
+  }
 }
 
 /** The undo confirmation dialog hosted in shell.overlay. */
@@ -969,7 +986,14 @@ function UndoDialog(props) {
     setPhase({ kind: 'working' })
     const result = await props.confirmUndo(request, mode)
     setPhase(result?.ok === true
-      ? { kind: 'done', prefillOk: result.prefillOk === true, summary: result.summary ?? '' }
+      ? {
+        kind: 'done',
+        prefillOk: result.prefillOk === true,
+        summary: result.summary ?? '',
+        attachmentsRestored: result.attachmentsRestored ?? 0,
+        attachmentsFailed: result.attachmentsFailed ?? 0,
+        attachmentsDegraded: result.attachmentsDegraded === true,
+      }
       : { kind: 'error', code: result?.code, message: result?.message })
   }
   const chooseFiles = async () => {
@@ -998,6 +1022,8 @@ function UndoDialog(props) {
     children.push(React.createElement('div', { key: 'done-title', className: 'su-text', style: { fontWeight: 500, color: 'var(--dsw-alias-label-primary)' } }, t2('dialog.doneTitle')))
     children.push(React.createElement('div', { key: 'done-desc', className: 'su-text' }, t2('dialog.doneDesc')))
     if (phase.summary) children.push(React.createElement('div', { key: 'done-summary', className: 'su-text' }, phase.summary))
+    if (phase.attachmentsRestored > 0) children.push(React.createElement('div', { key: 'done-attachments', className: 'su-text' }, t2('dialog.attachmentsRestored').replace('{n}', String(phase.attachmentsRestored))))
+    if (phase.attachmentsFailed > 0 || phase.attachmentsDegraded) children.push(React.createElement('div', { key: 'done-attachments-failed', className: 'su-error' }, t2('dialog.attachmentsFailed')))
     if (!phase.prefillOk) children.push(React.createElement('div', { key: 'done-prefill', className: 'su-error' }, t2('dialog.prefillFailed')))
   } else if (phase.kind === 'select') {
     const steering = request?.kind === 'steering'
@@ -1430,13 +1456,25 @@ function UserRewindAction(props) {
   }, React.createElement(UndoIcon))
 }
 
-/** Restore the withdrawn prompt to the composer (facade setDraft, then DOM fallback). */
-function refillComposer(ctx, sessionId, text) {
+/** Restore the withdrawn prompt to the composer: text via the facade setDraft
+ * (then DOM fallback), attachments via the official conversation intake. An
+ * attachment-only message (empty text) still restores its attachments. Returns
+ * {textOk, restored, failed, degraded}; never throws into runUndo. */
+function refillComposer(ctx, sessionId, text, content, face) {
+  const wanted = Array.isArray(content?.attachments) ? content.attachments : []
   return new Promise((resolve) => {
-    if (!text) { resolve(false); return }
-    let tries = 0
     let settled = false
-    const finish = (ok) => { if (!settled) { settled = true; resolve(ok) } }
+    const finish = (value) => { if (!settled) { settled = true; resolve(value) } }
+    const withAttachments = (textOk) => {
+      restoreAttachments(ctx, sessionId, wanted, face)
+        .then(({ restored, failed, degraded }) => {
+          // An empty-text message counts as prefilled only when something landed.
+          finish({ textOk: text === '' ? restored > 0 : textOk, restored, failed, degraded })
+        })
+        .catch(() => finish({ textOk: false, restored: 0, failed: wanted.length, degraded: true }))
+    }
+    if (text === '') { withAttachments(true); return }
+    let tries = 0
     const write = () => {
       const actx = ctx.sessions.scope?.(sessionId)
       if (actx !== undefined) {
@@ -1458,12 +1496,84 @@ function refillComposer(ctx, sessionId, text) {
       return true
     }
     const attempt = () => {
-      if (write()) { setTimeout(() => { write(); finish(true) }, 400); return }
+      if (write()) { setTimeout(() => { write(); withAttachments(true) }, 400); return }
       if (tries++ < 50) setTimeout(attempt, 100)
-      else finish(false)
+      else withAttachments(false)
     }
     attempt()
   })
+}
+
+/**
+ * Re-materialize the withdrawn message's attachments into the composer draft
+ * through the official intake: conversation.createDrafts registers browser
+ * Files (uploads start immediately), input.addAttachments binds them to the
+ * draft. Images read their bytes via the session controller's readAttachment;
+ * files fetch the authenticated /api/file URL the Host derived. Any missing
+ * API degrades the whole attachment arm with a visible warning; per-item
+ * failures are counted and never block the remaining items.
+ */
+async function restoreAttachments(ctx, sessionId, wanted, face) {
+  if (wanted.length === 0) return { restored: 0, failed: 0, degraded: false }
+  const conversation = ctx.get('conversation')
+  const actx = ctx.sessions.scope?.(sessionId)
+  const input = actx !== undefined ? ctx.get('uiConversation')?.input?.for(actx) : undefined
+  if (typeof conversation?.createDrafts !== 'function' || typeof input?.addAttachments !== 'function' || typeof face?.readAttachment !== 'function') {
+    console.warn('session-undo: composer attachment APIs unavailable; attachments were not restored')
+    return { restored: 0, failed: wanted.length, degraded: true }
+  }
+  const files = []
+  let failed = 0
+  for (const item of wanted) {
+    try {
+      if (item.kind === 'image') {
+        const result = await face.readAttachment(item.attachment)
+        if (result?.ok !== true) { failed += 1; continue }
+        const ref = result.value.attachment
+        files.push(new File([result.value.data], ref.name ?? 'image', { type: ref.mediaType }))
+      } else {
+        const response = await fetch(item.url)
+        if (!response.ok) { failed += 1; continue }
+        const blob = await response.blob()
+        files.push(new File([blob], item.attachment?.name ?? 'file', { type: blob.type || 'application/octet-stream' }))
+      }
+    } catch { failed += 1 }
+  }
+  if (files.length === 0) return { restored: 0, failed, degraded: false }
+  let ordinary = true
+  try { ordinary = face.getSnapshot().subagent === null } catch { /* ordinary default */ }
+  let drafts
+  try {
+    drafts = conversation.createDrafts(sessionId, files, ordinary)
+  } catch (error) {
+    console.warn('session-undo: draft creation failed; attachments were not restored', error)
+    return { restored: 0, failed: failed + files.length, degraded: true }
+  }
+  const ids = drafts.map(draft => draft.id)
+  let added = input.addAttachments(ids)
+  if (added !== true) {
+    // A submission lock may clear momentarily; retry once before giving up.
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    added = input.addAttachments(ids)
+  }
+  if (added !== true) {
+    try { conversation.releaseDraftAttachments?.(drafts) } catch { /* ignore */ }
+    return { restored: 0, failed: failed + files.length, degraded: false }
+  }
+  // Bounded wait for the background uploads; the composer guards send itself,
+  // so a timeout here only affects the reported count, not correctness.
+  let errored = 0
+  const uploads = conversation.fileUploads
+  if (typeof uploads?.getSnapshot === 'function') {
+    const deadline = Date.now() + 15000
+    let state = uploads.getSnapshot()
+    while (Date.now() < deadline && ids.some((id) => state[id]?.status === 'uploading')) {
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      state = uploads.getSnapshot()
+    }
+    errored = ids.filter((id) => state[id]?.status === 'error').length
+  }
+  return { restored: ids.length - errored, failed: failed + errored, degraded: false }
 }
 
 function apply(ctx) {
@@ -1633,5 +1743,5 @@ function apply(ctx) {
   }
 }
 
-module.exports = { name: 'session-delete', inject: ['contextMenus', 'slots', 'locale', 'sessions'], apply, __rewindTest: { rewindCutsOf, rewindTargetSeqOfArgs, RewindVisibilityBuilder, runUndo, latestRewindAnchor, chatNodesOf, isClassComponent, rowRendererOf, stylesEffect, installRowAction, installChatViewVisibility } }
+module.exports = { name: 'session-delete', inject: ['contextMenus', 'slots', 'locale', 'sessions'], apply, __rewindTest: { rewindCutsOf, rewindTargetSeqOfArgs, RewindVisibilityBuilder, runUndo, latestRewindAnchor, chatNodesOf, isClassComponent, rowRendererOf, stylesEffect, installRowAction, installChatViewVisibility, refillComposer, restoreAttachments } }
 return module.exports; } });

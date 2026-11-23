@@ -217,3 +217,152 @@ test('row action seam warns once when rows cannot be taken over', () => {
     sandbox.console = realConsole
   }
 })
+
+test('restoreAttachments rebuilds files in order and binds them through the official intake', async () => {
+  const { restoreAttachments } = mod.__rewindTest
+  sandbox.File = File
+  sandbox.Blob = Blob
+  const created = []
+  const added = []
+  const conversation = {
+    createDrafts: (sessionId, files, ordinary) => {
+      created.push({ sessionId, files, ordinary })
+      return files.map((file, index) => ({ id: `d${index}`, file }))
+    },
+    fileUploads: { getSnapshot: () => ({ d0: { status: 'ready' }, d1: { status: 'ready' } }) },
+  }
+  const input = { addAttachments: (ids) => { added.push(ids); return true } }
+  const ctx = {
+    get: (name) => name === 'conversation' ? conversation : name === 'uiConversation' ? { input: { for: () => input } } : undefined,
+    sessions: { scope: () => ({}) },
+  }
+  const face = {
+    readAttachment: async (ref) => ({ ok: true, value: { attachment: ref, data: Uint8Array.of(1, 2, 3) } }),
+    getSnapshot: () => ({ subagent: null }),
+  }
+  sandbox.fetch = async () => ({ ok: true, blob: async () => new Blob(['bytes'], { type: 'application/pdf' }) })
+  try {
+    const wanted = [
+      { kind: 'image', attachment: { attachmentId: 'sha256:x', mediaType: 'image/png', name: 'pic.png' } },
+      { kind: 'file', attachment: { name: 'report.pdf' }, url: '/api/file?path=%2Fattachments%2Fv1%2Ffiles%2Fxx' },
+    ]
+    const result = await restoreAttachments(ctx, 's1', wanted, face)
+    assert.equal(result.restored, 2)
+    assert.equal(result.failed, 0)
+    assert.equal(result.degraded, false)
+    assert.equal(created[0].ordinary, true)
+    assert.equal(created[0].files[0].name, 'pic.png')
+    assert.equal(created[0].files[0].type, 'image/png')
+    assert.equal(created[0].files[1].name, 'report.pdf')
+    assert.equal(created[0].files[1].type, 'application/pdf')
+    assert.deepEqual(plain(added[0]), ['d0', 'd1'])
+  } finally {
+    delete sandbox.fetch
+    delete sandbox.File
+    delete sandbox.Blob
+  }
+})
+
+test('restoreAttachments degrades visibly when the conversation service is missing', async () => {
+  const { restoreAttachments } = mod.__rewindTest
+  const warnings = []
+  const realConsole = sandbox.console
+  sandbox.console = { warn: (...args) => warnings.push(args.join(' ')), error: () => {}, log: () => {} }
+  try {
+    const ctx = { get: () => undefined, sessions: { scope: () => ({}) } }
+    const result = await restoreAttachments(ctx, 's1', [{ kind: 'image', attachment: {} }], {})
+    assert.equal(result.degraded, true)
+    assert.equal(result.failed, 1)
+    assert.equal(result.restored, 0)
+    assert.ok(warnings.some(w => w.includes('attachment')))
+  } finally {
+    sandbox.console = realConsole
+  }
+})
+
+test('refillComposer restores an attachment-only message (empty text)', async () => {
+  const { refillComposer } = mod.__rewindTest
+  sandbox.File = File
+  sandbox.Blob = Blob
+  sandbox.setTimeout = setTimeout
+  sandbox.clearTimeout = clearTimeout
+  const added = []
+  const conversation = {
+    createDrafts: (_sessionId, files) => files.map((_file, index) => ({ id: `a${index}` })),
+    fileUploads: { getSnapshot: () => ({ a0: { status: 'ready' } }) },
+  }
+  const input = { addAttachments: (ids) => { added.push(ids); return true }, setDraft: () => {} }
+  const ctx = {
+    get: (name) => name === 'conversation' ? conversation : { input: { for: () => input } },
+    sessions: { scope: () => ({}) },
+  }
+  const face = {
+    readAttachment: async (ref) => ({ ok: true, value: { attachment: ref, data: Uint8Array.of(1) } }),
+    getSnapshot: () => ({ subagent: null }),
+  }
+  try {
+    const result = await refillComposer(ctx, 's1', '', { attachments: [{ kind: 'image', attachment: { mediaType: 'image/png', name: 'p.png' } }] }, face)
+    assert.equal(result.textOk, true)
+    assert.equal(result.restored, 1)
+    assert.equal(result.failed, 0)
+    assert.deepEqual(plain(added[0]), ['a0'])
+  } finally {
+    delete sandbox.File
+    delete sandbox.Blob
+    delete sandbox.setTimeout
+    delete sandbox.clearTimeout
+  }
+})
+
+test('runUndo fetches the withdrawn content and reports attachment restore counts', async () => {
+  const { runUndo } = mod.__rewindTest
+  sandbox.File = File
+  sandbox.Blob = Blob
+  sandbox.setTimeout = setTimeout
+  sandbox.clearTimeout = clearTimeout
+  let materialized = []
+  const chat = { nodes: { values: () => materialized } }
+  const uiConversation = {
+    binding: () => ({ target: () => ({ getSnapshot: () => chat }) }),
+    input: { for: () => ({ setDraft: () => {}, addAttachments: () => true }) },
+  }
+  const conversation = {
+    createDrafts: (_sessionId, files) => files.map(() => ({ id: 'z0' })),
+    fileUploads: { getSnapshot: () => ({ z0: { status: 'ready' } }) },
+  }
+  const face = {
+    command: async () => {
+      materialized = [{ kind: 'command', anchorSeq: 10, data: { name: 'rewind', args: '@5 both', outcome: { kind: 'success', sourceEventSeq: 8, text: 'Rewound' } } }]
+      return { ok: true }
+    },
+    readAttachment: async (ref) => ({ ok: true, value: { attachment: ref, data: Uint8Array.of(1) } }),
+    getSnapshot: () => ({ subagent: null }),
+  }
+  const ctx = {
+    get: (name) => name === 'uiConversation' ? uiConversation : name === 'conversation' ? conversation : undefined,
+    sessions: { binding: () => ({ session: face }), scope: () => ({}) },
+  }
+  sandbox.fetch = async (url) => {
+    if (String(url).includes('message-content')) {
+      return {
+        ok: true,
+        text: async () => JSON.stringify({ ok: true, data: { seq: 5, text: 'prompt', attachments: [{ kind: 'image', attachment: { mediaType: 'image/png', name: 'p.png' } }], omitted: 0 } }),
+      }
+    }
+    return { ok: true, blob: async () => new Blob(['x']) }
+  }
+  try {
+    const result = await runUndo(ctx, { sessionId: 's1', seq: 5, text: 'prompt' }, 'both')
+    assert.equal(result.ok, true)
+    assert.equal(result.prefillOk, true)
+    assert.equal(result.attachmentsRestored, 1)
+    assert.equal(result.attachmentsFailed, 0)
+    assert.equal(result.attachmentsDegraded, false)
+  } finally {
+    delete sandbox.fetch
+    delete sandbox.File
+    delete sandbox.Blob
+    delete sandbox.setTimeout
+    delete sandbox.clearTimeout
+  }
+})

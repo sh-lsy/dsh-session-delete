@@ -570,10 +570,11 @@ test('messageContent extracts text, image refs, and provider-derived file downlo
   const result = await messageContent(ctx, { sessionId: 's1', seq: 1 })
   assert.equal(result.ok, true)
   assert.equal(result.data.text, 'look\nplease')
-  assert.deepEqual(result.data.images, [{ attachment: imageRef }])
-  assert.equal(result.data.files.length, 1)
-  assert.deepEqual(result.data.files[0].attachment, fileRef)
-  assert.equal(result.data.files[0].url, `/api/file?path=${encodeURIComponent(join(root, 'files', 'bb', 'b'.repeat(64), 'report.pdf'))}`)
+  // Attachments keep the message's original interleaved order.
+  assert.deepEqual(result.data.attachments, [
+    { kind: 'image', attachment: imageRef },
+    { kind: 'file', attachment: fileRef, url: `/api/file?path=${encodeURIComponent(join(root, 'files', 'bb', 'b'.repeat(64), 'report.pdf'))}` },
+  ])
   assert.equal(result.data.omitted, 0)
 })
 
@@ -606,13 +607,13 @@ test('messageContent omits file attachments whose host location cannot be verifi
   // No attachments service: nothing can be located.
   const r1 = await messageContent({ get: (name) => name === 'sessions' ? sessions : undefined }, { sessionId: 's1', seq: 1 })
   assert.equal(r1.ok, true)
-  assert.equal(r1.data.files.length, 0)
+  assert.equal(r1.data.attachments.length, 0)
   assert.equal(r1.data.omitted, 1)
   // A host path outside the attachment root is refused (containment guard).
   const root = join(tmpdir(), 'attachments', 'v1')
   const r2 = await messageContent({
     get: (name) => name === 'sessions' ? sessions : { root, fileHostPath: () => join(tmpdir(), 'elsewhere', 'x.bin') },
   }, { sessionId: 's1', seq: 1 })
-  assert.equal(r2.data.files.length, 0)
+  assert.equal(r2.data.attachments.length, 0)
   assert.equal(r2.data.omitted, 1)
 })

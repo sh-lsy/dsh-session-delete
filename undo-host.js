@@ -754,12 +754,13 @@ export function listSnapshots(snapshots, body) {
  * references survive the rewind. Images travel as complete refs (the client
  * reads their bytes through the session controller's readAttachment); files
  * travel as refs plus an authenticated /api/file URL derived from the
- * provider's own fileHostPath. A file whose host location cannot be verified
- * (no host-file-backed store, or a path outside the attachment root) is
- * omitted rather than guessed at — fail closed, like the delete-side GC gate.
+ * provider's own fileHostPath. Attachments keep the message's original order.
+ * A file whose host location cannot be verified (no host-file-backed store,
+ * or a path outside the attachment root) is omitted rather than guessed at —
+ * fail closed, like the delete-side GC gate.
  * @param ctx - Host context.
  * @param body - `{ sessionId, seq }` of the target user message.
- * @returns `{ ok, data: { seq, text, images, files, omitted } }` or a refusal.
+ * @returns `{ ok, data: { seq, text, attachments, omitted } }` or a refusal.
  */
 export async function messageContent(ctx, body) {
   const sessionId = body.sessionId
@@ -780,20 +781,19 @@ export async function messageContent(ctx, body) {
     return { ok: false, code: 'not-a-user-message', message: 'the target is not a user message' }
   }
   const content = Array.isArray(event.data.content) ? event.data.content : []
-  const images = []
-  const files = []
+  const attachments = []
   let omitted = 0
   const store = ctx.get('attachments')
   for (const block of content) {
     if (block?.type === 'image' && block.attachment?.attachmentId !== undefined) {
-      images.push({ attachment: block.attachment })
+      attachments.push({ kind: 'image', attachment: block.attachment })
     } else if (block?.type === 'file' && block.attachment?.attachmentId !== undefined) {
       const url = fileDownloadUrl(store, block.attachment)
       if (url === undefined) omitted += 1
-      else files.push({ attachment: block.attachment, url })
+      else attachments.push({ kind: 'file', attachment: block.attachment, url })
     }
   }
-  return { ok: true, data: { seq, text: textOf(content), images, files, omitted } }
+  return { ok: true, data: { seq, text: textOf(content), attachments, omitted } }
 }
 
 /** The authenticated /api/file URL for one stored file object, or undefined when unverifiable. */
