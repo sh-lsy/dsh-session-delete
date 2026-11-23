@@ -5,7 +5,7 @@
  */
 import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, rm, stat, utimes, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -34,7 +34,7 @@ function makeContext(options = {}) {
   const routes = new Map()
   const commands = []
   const agentState = { status: options.agentStatus ?? 'idle' }
-  return {
+  const ctx = {
     routes,
     commands,
     archived,
@@ -59,10 +59,6 @@ function makeContext(options = {}) {
       get: (id) => workspaces.find(workspace => workspace.id === id),
       get archivedSessionIds() { return [...archived] },
       get pinnedSessionIds() { return [...pinned] },
-      archiveSession: async (id) => {
-        if (options.failArchive) throw new Error('archive failed')
-        archived.add(id); pinned.delete(id) // archive drops the pin in the same write
-      },
       unarchiveSession: async (id) => { archived.delete(id) },
       pinSession: async (id) => { if (archived.has(id)) throw new Error('cannot pin an archived session'); pinned.add(id) },
       unpinSession: async (id) => { pinned.delete(id) },
@@ -80,7 +76,18 @@ function makeContext(options = {}) {
       if (name === 'sessions' && options.live === true) return { get: () => ({ header: {} }) }
       return options.services?.[name]
     },
+    subprocess: { resolveExecutable: async () => null, spawn: () => { throw new Error('host double has no subprocess') } },
   }
+  // Mirror the official registry: an already archived id resolves without
+  // writing, asking, or stopping; stopActivity dispatches workspace/session-stop
+  // AFTER the durable archive write (the event contract's ordering).
+  ctx.workspaceRegistry.archiveSession = async (id, opts = {}) => {
+    if (archived.has(id)) return
+    if (options.failArchive) throw new Error('archive failed')
+    archived.add(id); pinned.delete(id) // archive drops the pin in the same write
+    if (opts.stopActivity === true) await ctx.parallel('workspace/session-stop', { sessionId: id })
+  }
+  return ctx
 }
 
 /** Build one stored-session snapshot. */
@@ -307,6 +314,16 @@ function snapFor(log, id, overrides = {}) {
   return { ...base, ...overrides, header: { ...base.header, id } }
 }
 
+/** A faithful local-v1 attachment store double: provider-owned path derivation. */
+function localStore(root) {
+  const digest = (ref) => String(ref.attachmentId).replace(/^sha256:/u, '')
+  return {
+    root,
+    imageHostPath: (ref) => join(root, 'objects', digest(ref).slice(0, 2), digest(ref)),
+    fileHostPath: (ref) => join(root, 'files', digest(ref).slice(0, 2), digest(ref), ref.name),
+  }
+}
+
 test('batchInspect lists a workspace sessions and refuses an unknown workspace', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-sd-'))
   try {
@@ -377,7 +394,7 @@ test('batchDelete deep cleanup reclaims exclusive attachments and keeps shared o
       stat: async (id) => snapFor(dirs[id].log, id),
       // After deletion the listing reflects only the sessions still on disk.
       list: async () => [s1, s2, s3].map(id => snapFor(dirs[id].log, id)).filter(s => existsSync(s.location.path)),
-      services: { attachments: { root: attachRoot } },
+      services: { attachments: localStore(attachRoot) },
     })
     const result = await batchDelete(ctx, resolveConfig(undefined), { sessionIds: [s1, s2], deepAttachments: true })
     assert.equal(result.ok, true)
@@ -420,7 +437,7 @@ test('batchDelete deep cleanup fails closed when a remaining session is unreadab
       failRead: [s3], // the remaining session cannot be read -> its refs are unknown
       stat: async (id) => snapFor(dirs[id].log, id),
       list: async () => [s1, s3].map(id => snapFor(dirs[id].log, id)).filter(s => existsSync(s.location.path)),
-      services: { attachments: { root: attachRoot } },
+      services: { attachments: localStore(attachRoot) },
     })
     const result = await batchDelete(ctx, resolveConfig(undefined), { sessionIds: [s1], deepAttachments: true })
     assert.equal(result.ok, true)
@@ -462,7 +479,7 @@ test('batchDelete deep cleanup preserves attachments of a session whose deletion
       // s2 cannot be deleted (migration-required) so it stays on disk holding hexB.
       stat: async (id) => snapFor(dirs[id].log, id, id === s2 ? { formatStatus: 'migration-required' } : {}),
       list: async () => [s1, s2, s3].map(id => snapFor(dirs[id].log, id)).filter(s => existsSync(s.location.path)),
-      services: { attachments: { root: attachRoot } },
+      services: { attachments: localStore(attachRoot) },
     })
     const result = await batchDelete(ctx, resolveConfig(undefined), { sessionIds: [s1, s2], deepAttachments: true })
     assert.equal(result.ok, true)
@@ -518,6 +535,139 @@ test('a title-less session is deletable with acknowledgement when title confirma
     assert.equal(refused.code, 'title-required')
     const deleted = await deleteSession(ctx, config, { sessionId: SESSION, acknowledged: true })
     assert.equal(deleted.ok, true)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('an already archived session with activity gets exactly one manual stop', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-sd-'))
+  try {
+    const { log } = await sessionDir(root)
+    const ctx = makeContext({ stat: async () => snapshot(log), archived: [SESSION] })
+    ctx.waterfall = async () => [{ kind: 'schedule', id: 'task-1' }]
+    const calls = []
+    ctx.parallel = async (name) => { calls.push({ name, archived: ctx.archived.has(SESSION) }) }
+    const deleted = await deleteSession(ctx, resolveConfig(undefined), { sessionId: SESSION, stopActivity: true })
+    assert.equal(deleted.ok, true)
+    // The registry neither asks nor stops for an already archived id, so the
+    // plugin's manual dispatch is the only one — archive already durable.
+    assert.deepEqual(calls, [{ name: 'workspace/session-stop', archived: true }])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('stop dispatch for a fresh archive happens once, after the durable archive write', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-sd-'))
+  try {
+    const { log } = await sessionDir(root)
+    const ctx = makeContext({ stat: async () => snapshot(log) })
+    ctx.waterfall = async () => [{ kind: 'job', id: 'job-1' }]
+    const calls = []
+    ctx.parallel = async (name) => { calls.push({ name, archived: ctx.archived.has(SESSION) }) }
+    const deleted = await deleteSession(ctx, resolveConfig(undefined), { sessionId: SESSION, stopActivity: true })
+    assert.equal(deleted.ok, true)
+    // Exactly one dispatch (the archive's own), and the archive set was durable
+    // when it fired — no premature pre-archive duplicate.
+    assert.deepEqual(calls, [{ name: 'workspace/session-stop', archived: true }])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('deep cleanup fails closed when the attachment store is not a verifiable local-v1 layout', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-sd-'))
+  try {
+    const hexA = 'a'.repeat(64)
+    const s1 = SESSION
+    const dirs = { [s1]: await sessionDir(root, s1) }
+    const logs = { [s1]: [{ attachment: { attachmentId: `sha256:${hexA}` } }] }
+    const attachRoot = join(root, 'attachments', 'v1')
+    await mkdir(join(attachRoot, 'objects', hexA.slice(0, 2)), { recursive: true })
+    await writeFile(join(attachRoot, 'objects', hexA.slice(0, 2), hexA), 'bytes')
+    const workspace = { id: 'w1', path: '/tmp/demo', sessionIds: [s1], async detachSession() {} }
+    const ctx = makeContext({
+      workspaces: [workspace],
+      logs,
+      stat: async (id) => snapFor(dirs[id].log, id),
+      list: async () => [s1].map(id => snapFor(dirs[id].log, id)).filter(s => existsSync(s.location.path)),
+      // root only, no hostPath functions: the layout cannot be verified.
+      services: { attachments: { root: attachRoot } },
+    })
+    const result = await batchDelete(ctx, resolveConfig(undefined), { sessionIds: [s1], deepAttachments: true })
+    assert.equal(result.ok, true)
+    assert.equal(result.data.attachments.skipped, true)
+    assert.equal(result.data.attachments.removed, 0)
+    assert.equal(result.data.attachments.kept, 1)
+    assert.equal(existsSync(join(attachRoot, 'objects', hexA.slice(0, 2), hexA)), true)
+    assert.ok(result.data.warnings.some(w => w.includes('local-v1')))
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('deep cleanup preserves an object whose provider path disagrees with the layout', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-sd-'))
+  try {
+    const hexA = 'a'.repeat(64)
+    const s1 = SESSION
+    const dirs = { [s1]: await sessionDir(root, s1) }
+    const logs = { [s1]: [{ attachment: { attachmentId: `sha256:${hexA}` } }] }
+    const attachRoot = join(root, 'attachments', 'v1')
+    await mkdir(join(attachRoot, 'objects', hexA.slice(0, 2)), { recursive: true })
+    await writeFile(join(attachRoot, 'objects', hexA.slice(0, 2), hexA), 'bytes')
+    const workspace = { id: 'w1', path: '/tmp/demo', sessionIds: [s1], async detachSession() {} }
+    const divergent = {
+      ...localStore(attachRoot),
+      // A backend that relocated its image objects: the derived path no longer
+      // matches the local-v1 signature, so the object must be preserved.
+      imageHostPath: (ref) => join(attachRoot, 'objects-v2', String(ref.attachmentId).slice(7, 9), String(ref.attachmentId).slice(7)),
+    }
+    const ctx = makeContext({
+      workspaces: [workspace],
+      logs,
+      stat: async (id) => snapFor(dirs[id].log, id),
+      list: async () => [s1].map(id => snapFor(dirs[id].log, id)).filter(s => existsSync(s.location.path)),
+      services: { attachments: divergent },
+    })
+    const result = await batchDelete(ctx, resolveConfig(undefined), { sessionIds: [s1], deepAttachments: true })
+    assert.equal(result.ok, true)
+    assert.equal(result.data.attachments.removed, 0)
+    assert.equal(existsSync(join(attachRoot, 'objects', hexA.slice(0, 2), hexA)), true)
+    assert.ok(result.data.warnings.some(w => w.includes('disagrees')))
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('concurrent applies keep independent undo handles (no module-global cross-talk)', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-sd-'))
+  try {
+    const { log } = await sessionDir(root)
+    const dataA = join(root, 'undo-a')
+    const dataB = join(root, 'undo-b')
+    const record = { sessionId: SESSION, turn: 1, startTree: 'x', endTree: 'y', cwd: '/tmp/demo', time: Date.now() }
+    await mkdir(dataA, { recursive: true })
+    await mkdir(dataB, { recursive: true })
+    await writeFile(join(dataA, 'snapshots.json'), JSON.stringify([record]))
+    await writeFile(join(dataB, 'snapshots.json'), JSON.stringify([record]))
+    const workspace = { sessionIds: [SESSION], async detachSession() {} }
+    const ctxA = makeContext({ stat: async () => snapshot(log), workspaces: [workspace] })
+    const ctxB = makeContext({ stat: async () => snapshot(log), workspaces: [workspace] })
+    apply(ctxA, { dataRoot: dataA })
+    apply(ctxB, { dataRoot: dataB })
+    // Delete through instance A's registered owner-only route.
+    const route = ctxA.routes.get('/session-delete/delete')
+    const body = JSON.stringify({ sessionId: SESSION, acknowledged: true })
+    const req = { method: 'POST', [Symbol.asyncIterator]: async function* () { yield Buffer.from(body) } }
+    const res = { statusCode: 0, setHeader() {}, end(payload) { this.payload = payload } }
+    await route.handler(req, res, { principal: { kind: 'owner' } })
+    assert.equal(JSON.parse(res.payload).ok, true)
+    const storeA = JSON.parse(await readFile(join(dataA, 'snapshots.json'), 'utf8'))
+    const storeB = JSON.parse(await readFile(join(dataB, 'snapshots.json'), 'utf8'))
+    assert.equal(storeA.some(r => r.sessionId === SESSION), false, 'instance A forgot its own record')
+    assert.equal(storeB.some(r => r.sessionId === SESSION), true, 'instance B must be untouched')
   } finally {
     await rm(root, { recursive: true, force: true })
   }

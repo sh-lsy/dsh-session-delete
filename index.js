@@ -24,7 +24,7 @@
 import { createHash } from 'node:crypto'
 import { readdir, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join, sep } from 'node:path'
 import { mountUndo, resolveUndoConfig, undoDefaults } from './undo-host.js'
 
 /** Cordis plugin name. */
@@ -103,16 +103,15 @@ export function apply(ctx, rawConfig) {
     auth: 'required',
     handler: (req, res, peer) => (batch ? serveBatch : serve)(req, res, peer, run),
   }), `session-delete: POST ${path}`)
+  // Per-apply undo handle: a module global would let concurrent instances
+  // (isolate groups / double mounts) forget each other's snapshots, and one
+  // instance's unload would null another instance's handle.
+  const undo = mountUndo(ctx, config)
   route(INSPECT_PATH, body => inspectSession(ctx, config, body.sessionId))
-  route(DELETE_PATH, body => deleteSession(ctx, config, body))
+  route(DELETE_PATH, body => deleteSession(ctx, config, body, undo))
   route(BATCH_INSPECT_PATH, body => batchInspect(ctx, config, body.workspaceId), true)
-  route(BATCH_DELETE_PATH, body => batchDelete(ctx, config, body), true)
-  undoHandle = mountUndo(ctx, config)
-  ctx.effect(() => () => { undoHandle = null })
+  route(BATCH_DELETE_PATH, body => batchDelete(ctx, config, body, undo), true)
 }
-
-/** The mounted undo recorder's handle, used to forget a deleted session's snapshots. */
-let undoHandle = null
 
 /**
  * Owner gate, method gate, and bounded JSON parse shared by every route.
@@ -250,9 +249,10 @@ export async function inspectSession(ctx, config, sessionId) {
  * @param ctx - Host context.
  * @param config - resolved plugin config.
  * @param request - `{ sessionId, confirmTitle?, acknowledged?, stopActivity? }`.
+ * @param undo - the mounted undo recorder handle; forgets the deleted session's snapshots.
  * @returns the deletion report, a refusal, or a stop request.
  */
-export async function deleteSession(ctx, config, request) {
+export async function deleteSession(ctx, config, request, undo) {
   const sessionId = request.sessionId
   const inspected = await inspectSession(ctx, config, sessionId)
   if (inspected.ok !== true) return inspected
@@ -279,10 +279,18 @@ export async function deleteSession(ctx, config, request) {
     if (request.stopActivity !== true) {
       return { ok: false, code: 'needs-stop', message: 'planned work must be stopped first', activity }
     }
-    try {
-      await ctx.parallel('workspace/session-stop', { sessionId })
-    } catch (error) {
-      warnings.push(`stop: ${messageOf(error)}`)
+    // archiveSession({ stopActivity: true }) dispatches workspace/session-stop
+    // itself AFTER the durable archive write — the event contract requires the
+    // archive set to be durable when it dispatches, and a second pre-archive
+    // dispatch would double-stop non-idempotent custom providers. Only an
+    // ALREADY archived session needs the manual dispatch: the registry neither
+    // asks nor stops for an id that is already archived.
+    if (data.archived === true) {
+      try {
+        await ctx.parallel('workspace/session-stop', { sessionId })
+      } catch (error) {
+        warnings.push(`stop: ${messageOf(error)}`)
+      }
     }
   }
 
@@ -353,7 +361,7 @@ export async function deleteSession(ctx, config, request) {
   const projectionCache = await dropProjectionCache(ctx, sessionId, warnings)
   await dropAccounting(ctx, sessionId, warnings)
   // Forget the deleted session's rewind snapshots so the store does not accumulate.
-  await undoHandle?.forgetSession(sessionId)?.catch(error => warnings.push(`snapshots: ${messageOf(error)}`))
+  await undo?.forgetSession(sessionId)?.catch(error => warnings.push(`snapshots: ${messageOf(error)}`))
   ctx.logger.info(
     'session-delete: removed Session %s (%d bytes, worktree %s)',
     sessionId, data.sizeBytes ?? 0, worktree.status,
@@ -421,9 +429,10 @@ export async function batchInspect(ctx, config, workspaceId) {
  * @param ctx - Host context.
  * @param config - resolved plugin config.
  * @param request - `{ sessionIds: string[], deepAttachments?: boolean }`.
+ * @param undo - the mounted undo recorder handle, passed through to each deletion.
  * @returns per-session results, freed bytes, and the attachment report.
  */
-export async function batchDelete(ctx, config, request) {
+export async function batchDelete(ctx, config, request, undo) {
   const ids = Array.isArray(request.sessionIds)
     ? [...new Set(request.sessionIds.filter(id => typeof id === 'string' && SESSION_ID.test(id)))]
     : []
@@ -448,7 +457,7 @@ export async function batchDelete(ctx, config, request) {
   const results = []
   let freedBytes = 0
   for (const sessionId of ids) {
-    const outcome = await deleteSession(ctx, config, { sessionId, stopActivity: true, acknowledged: true })
+    const outcome = await deleteSession(ctx, config, { sessionId, stopActivity: true, acknowledged: true }, undo)
     if (outcome.ok === true) {
       freedBytes += outcome.data.bytes ?? 0
       results.push({ sessionId, ok: true, bytes: outcome.data.bytes ?? null })
@@ -479,7 +488,8 @@ export async function batchDelete(ctx, config, request) {
     } else {
       const reclaimable = new Set([...deletedRefs].filter(hex => !remainingRefs.has(hex)))
       attachments = await reclaimAttachments(ctx, reclaimable, warnings)
-      attachments.kept = deletedRefs.size - reclaimable.size
+      // A skipped GC preserved everything the deleted sessions referenced.
+      attachments.kept = attachments.skipped === true ? deletedRefs.size : deletedRefs.size - reclaimable.size
     }
   }
 
@@ -518,24 +528,67 @@ async function refsOfSession(ctx, sessionId) {
 
 /**
  * Remove content-addressed attachment objects no remaining Session references.
+ *
+ * The attachment seam treats AttachmentId as opaque: consumers must neither
+ * parse its representation nor derive filesystem paths from it. Object deletion
+ * is therefore gated on a verifiable host-file-backed local-v1 layout, and every
+ * deletion path is cross-checked against the provider's own imageHostPath /
+ * fileHostPath derivation; any disagreement preserves the object (fail closed).
+ * Reference counting stays the conservative text match in refsOfSession.
  * @param ctx - Host context.
  * @param reclaimable - the 64-hex digests proven unreferenced by remaining Sessions.
  * @param warnings - sink for non-fatal removal failures.
  * @returns counts and freed bytes (alias hardlinks are not double counted).
  */
 async function reclaimAttachments(ctx, reclaimable, warnings) {
-  const root = ctx.get('attachments')?.root
+  const store = ctx.get('attachments')
+  const root = store?.root
   if (root === undefined || reclaimable.size === 0) return { removed: 0, kept: 0, freedBytes: 0 }
+  if (typeof root !== 'string'
+    || typeof store.imageHostPath !== 'function'
+    || typeof store.fileHostPath !== 'function'
+    || basename(root) !== 'v1' || basename(dirname(root)) !== 'attachments'
+    || !(await hasLocalV1Layout(root))) {
+    warnings.push('deep attachment GC skipped: attachment store is not a verifiable host-file-backed local-v1 layout; all attachments preserved')
+    return { removed: 0, kept: reclaimable.size, freedBytes: 0, skipped: true }
+  }
+  const within = (path) => typeof path === 'string' && (path === root || path.startsWith(root + sep))
   let removed = 0
   let freedBytes = 0
   for (const hex of reclaimable) {
     const bucket = hex.slice(0, 2)
+    const attachmentId = `sha256:${hex}`
+    // Provider-owned locations. undefined or a throw means this backend does
+    // not host-store that component, so nothing may be deleted for it.
+    let imagePath
+    let aliasDir
+    try { imagePath = store.imageHostPath({ attachmentId }) } catch { imagePath = undefined }
+    try {
+      const filePath = store.fileHostPath({ attachmentId, name: 'file' })
+      aliasDir = typeof filePath === 'string' ? dirname(filePath) : undefined
+    } catch { aliasDir = undefined }
+    if (imagePath !== undefined && imagePath !== join(root, 'objects', bucket, hex)) {
+      warnings.push(`attachment ${hex}: provider image path disagrees with the local-v1 layout; preserved`)
+      continue
+    }
+    if (aliasDir !== undefined && aliasDir !== join(root, 'files', bucket, hex)) {
+      warnings.push(`attachment ${hex}: provider file path disagrees with the local-v1 layout; preserved`)
+      continue
+    }
+    if (imagePath === undefined && aliasDir === undefined) {
+      warnings.push(`attachment ${hex}: provider exposes no host object location; preserved`)
+      continue
+    }
     // The normalized image and the verbatim file object hold the real bytes;
     // the files/ tree is hardlinked aliases, removed without counting bytes.
-    const dataPaths = [join(root, 'objects', bucket, hex), join(root, 'file-objects', bucket, hex)]
-    const aliasPath = join(root, 'files', bucket, hex)
+    // file-objects has no public hostPath API: derive the sibling only under
+    // the verified layout signature and a provider-confirmed file alias.
+    const dataPaths = []
+    if (imagePath !== undefined) dataPaths.push(imagePath)
+    if (aliasDir !== undefined) dataPaths.push(join(root, 'file-objects', bucket, hex))
     let touched = false
     for (const path of dataPaths) {
+      if (!within(path)) continue
       try {
         const identity = await stat(path)
         await rm(path, { force: true })
@@ -545,14 +598,27 @@ async function reclaimAttachments(ctx, reclaimable, warnings) {
         if (error?.code !== 'ENOENT') warnings.push(`attachment ${hex}: ${messageOf(error)}`)
       }
     }
-    try {
-      await rm(aliasPath, { recursive: true, force: true })
-    } catch (error) {
-      if (error?.code !== 'ENOENT') warnings.push(`attachment alias ${hex}: ${messageOf(error)}`)
+    if (aliasDir !== undefined && within(aliasDir)) {
+      try {
+        await rm(aliasDir, { recursive: true, force: true })
+      } catch (error) {
+        if (error?.code !== 'ENOENT') warnings.push(`attachment alias ${hex}: ${messageOf(error)}`)
+      }
     }
     if (touched) removed++
   }
   return { removed, kept: 0, freedBytes }
+}
+
+/** Whether the root shows at least one directory of the shipped local-v1 object layout. */
+async function hasLocalV1Layout(root) {
+  for (const name of ['objects', 'file-objects', 'files']) {
+    try {
+      const identity = await stat(join(root, name))
+      if (identity.isDirectory()) return true
+    } catch { /* absent: try the next store directory */ }
+  }
+  return false
 }
 
 /**
