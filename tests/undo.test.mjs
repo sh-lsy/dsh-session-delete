@@ -8,13 +8,13 @@ import assert from 'node:assert/strict'
 import { spawn, execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { promisify } from 'node:util'
 
 import {
-  clearQueue, executeRewind, listCandidates, locateWorkspace, previewTurn, pruneShadowObjects, resolveRewind, resolveUndoConfig, revertTurn, runGit, snapshotTree, surfaceRangeBySeq, surfaceRewindRange, textOf, turnOfSeq,
+  clearQueue, dataRootOf, executeRewind, listCandidates, locateWorkspace, mountUndo, previewTurn, pruneShadowObjects, resolveRewind, resolveUndoConfig, revertTurn, runGit, snapshotTree, surfaceRangeBySeq, surfaceRewindRange, textOf, turnOfSeq,
 } from '../undo-host.js'
 
 const execFileAsync = promisify(execFile)
@@ -387,6 +387,160 @@ test('pruneShadowObjects keeps retained trees and prunes unretained ones', async
     const co = await runGit(ctx, config, 'git', ['checkout', treeA, '--', 'a.txt'], { cwd: workspace.root, env: { ...workspace.env, GIT_INDEX_FILE: join(workspace.objects, 'co-index') }, signal })
     assert.equal(co.exitCode, 0)
     assert.equal(await readFile(join(dir, 'a.txt'), 'utf8'), 'v1')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    await rm(data, { recursive: true, force: true })
+  }
+})
+
+/** Mount mountUndo against a minimal Host double; captures event listeners and routes. */
+function mountHarness(dir, data, subprocessImpl) {
+  const listeners = new Map()
+  const routes = new Map()
+  const ctx = {
+    subprocess: subprocessImpl ?? makeSubprocess(),
+    logger: { info() {}, warn() {} },
+    effect: (fn) => { fn(); return () => {} },
+    on: (name, fn) => { listeners.set(name, fn); return () => {} },
+    inject: (_names, cb) => { cb({ effect: (fn) => fn(), commands: { register: () => () => {} } }); return () => {} },
+    webServer: { register: (route) => { routes.set(route.path, route); return () => {} } },
+    get: () => undefined,
+  }
+  const config = resolveUndoConfig({ dataRoot: data })
+  const handle = mountUndo(ctx, config)
+  return { ctx, config, handle, listeners, routes }
+}
+
+test('dataRootOf honors DSH_HOME like the harness home resolution', () => {
+  const saved = process.env.DSH_HOME
+  try {
+    process.env.DSH_HOME = join(tmpdir(), 'dsh-home-env')
+    assert.equal(dataRootOf({ dataRoot: '' }), join(process.env.DSH_HOME, 'session-undo'))
+    // A blank override is treated as unset, never the current directory.
+    process.env.DSH_HOME = '   '
+    assert.equal(dataRootOf({ dataRoot: '' }), join(homedir(), '.dsh', 'session-undo'))
+    delete process.env.DSH_HOME
+    assert.equal(dataRootOf({ dataRoot: '' }), join(homedir(), '.dsh', 'session-undo'))
+    // An explicit dataRoot keeps highest precedence.
+    process.env.DSH_HOME = join(tmpdir(), 'dsh-home-env')
+    assert.equal(dataRootOf({ dataRoot: join(tmpdir(), 'explicit') }), join(tmpdir(), 'explicit'))
+  } finally {
+    if (saved === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = saved
+  }
+})
+
+test('tools/pre-execute gate observes exec.signal and always calls next()', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-undo-'))
+  const data = await mkdtemp(join(tmpdir(), 'dsh-undo-data-'))
+  try {
+    // A subprocess whose git never settles: the start snapshot stays pending.
+    const hang = {
+      resolveExecutable: async () => 'git',
+      spawn: () => ({
+        done: new Promise(() => {}),
+        collected: { stdout: { readFrom: () => ({ text: '', lossy: false }) }, stderr: { readFrom: () => ({ text: '' }) } },
+      }),
+    }
+    const { listeners } = mountHarness(dir, data, hang)
+    const gate = listeners.get('tools/pre-execute')
+    listeners.get('session/event')({ id: 's1', header: { cwd: dir } }, { type: 'turn/start', data: { turn: 1 } })
+    let nextCalls = 0
+    const next = async () => { nextCalls += 1 }
+    // An abort while the snapshot hangs must release the gate promptly.
+    const controller = new AbortController()
+    const settled = gate({ agent: { session: { id: 's1' } }, signal: controller.signal }, next)
+    controller.abort()
+    let timer
+    await Promise.race([
+      settled,
+      new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error('gate did not observe exec.signal abort')), 2000) }),
+    ])
+    clearTimeout(timer)
+    assert.equal(nextCalls, 1)
+    // An already-aborted signal does not wait at all.
+    const aborted = new AbortController()
+    aborted.abort()
+    await gate({ agent: { session: { id: 's1' } }, signal: aborted.signal }, next)
+    assert.equal(nextCalls, 2)
+    // No pending snapshot for an unknown session: next() immediately.
+    await gate({ agent: { session: { id: 'other' } } }, next)
+    assert.equal(nextCalls, 3)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    await rm(data, { recursive: true, force: true })
+  }
+})
+
+test('a turn recorded concurrently with mount-time shadow GC keeps its tree (serial queue)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-undo-'))
+  const data = await mkdtemp(join(tmpdir(), 'dsh-undo-data-'))
+  try {
+    await writeFile(join(dir, 'a.txt'), 'v1')
+    // Pre-create the shadow repo and one retained record so mount-time GC has
+    // a repo to prune; the concurrent recorder writes a second, new tree.
+    const pre = await harness(dir, data)
+    const treeA = await pre.snap()
+    await writeFile(join(data, 'snapshots.json'), JSON.stringify([
+      { sessionId: 's1', turn: 1, startTree: treeA, endTree: treeA, cwd: dir, time: Date.now() },
+    ]))
+    // Change the work tree so the concurrent recorder writes a DIFFERENT tree
+    // (identical content would hash to the retained treeA and mask the race).
+    await writeFile(join(dir, 'a.txt'), 'v2')
+    // Instrument git: prune's `gc` waits until the concurrent recorder's
+    // write-tree has settled, forcing the dangerous interleaving (retained-set
+    // copied before the new tree exists, gc running after it is written).
+    let gcSettled = false
+    let releaseWriteTree
+    const writeTreeDone = new Promise((resolve) => { releaseWriteTree = resolve })
+    const base = makeSubprocess()
+    const instrumented = {
+      resolveExecutable: base.resolveExecutable,
+      spawn: (opts) => {
+        if (opts.argv.includes('gc')) {
+          // Delay the ACTUAL gc spawn until the concurrent write-tree has
+          // settled: gc must run after the new tree exists on disk, or it
+          // prunes nothing and the dangerous interleaving is not exercised.
+          let real
+          const done = (async () => {
+            await Promise.race([writeTreeDone, new Promise((resolve) => setTimeout(resolve, 3000))])
+            real = base.spawn(opts)
+            const outcome = await real.done
+            gcSettled = true
+            return outcome
+          })()
+          return {
+            done,
+            collected: {
+              stdout: { readFrom: (index) => real?.collected.stdout.readFrom(index) ?? { text: '', lossy: false } },
+              stderr: { readFrom: (index) => real?.collected.stderr.readFrom(index) ?? { text: '' } },
+            },
+          }
+        }
+        const handle = base.spawn(opts)
+        if (opts.argv.includes('write-tree')) {
+          handle.done.then(releaseWriteTree, releaseWriteTree)
+        }
+        return handle
+      },
+    }
+    const { listeners } = mountHarness(dir, data, instrumented)
+    // Fire the recorder synchronously so its queue entry precedes the
+    // mount-time GC enqueue (which waits for the store load first).
+    listeners.get('session/event')({ id: 's2', header: { cwd: dir } }, { type: 'turn/start', data: { turn: 1 } })
+    const deadline = Date.now() + 15000
+    let store = []
+    while (Date.now() < deadline) {
+      store = JSON.parse(await readFile(join(data, 'snapshots.json'), 'utf8').catch(() => '[]'))
+      if (gcSettled && store.some(record => record.sessionId === 's2')) break
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    const record = store.find(entry => entry.sessionId === 's2')
+    assert.ok(record, 'the concurrent record persisted')
+    assert.ok(gcSettled, 'mount-time GC ran')
+    const exists = async (tree) => (await runGit(pre.ctx, pre.config, 'git', ['cat-file', '-e', tree], { cwd: dir, env: pre.workspace.env, signal: pre.signal })).exitCode === 0
+    assert.equal(await exists(record.startTree), true, 'concurrently recorded tree must survive GC')
+    assert.equal(await exists(treeA), true, 'retained tree survives GC')
   } finally {
     await rm(dir, { recursive: true, force: true })
     await rm(data, { recursive: true, force: true })

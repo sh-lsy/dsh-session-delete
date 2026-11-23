@@ -17,7 +17,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { copyFile, mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 
 const SNAPSHOTS_PATH = '/session-undo/snapshots'
 const PURGE_PATH = '/session-undo/purge'
@@ -74,7 +74,13 @@ export function resolveUndoConfig(raw) {
 
 /** Resolve the persistent data root for snapshot metadata and object stores. */
 export function dataRootOf(config) {
-  return config.dataRoot !== '' ? config.dataRoot : join(homedir(), '.dsh', 'session-undo')
+  if (config.dataRoot !== '') return config.dataRoot
+  // Mirror the harness home resolution (resolveDshHome): an explicit $DSH_HOME
+  // wins over ~/.dsh, and a blank override is treated as unset so it never
+  // resolves the store into the current working directory.
+  const envHome = process.env.DSH_HOME
+  const home = typeof envHome === 'string' && envHome.trim() !== '' ? envHome : join(homedir(), '.dsh')
+  return resolve(home, 'session-undo')
 }
 
 function storeName(cwd) {
@@ -330,6 +336,19 @@ export function mountUndo(ctx, config) {
     return writeTail
   }
 
+  // One serial queue for every shadow-git mutation. Snapshot recording and
+  // object pruning must not interleave: `gc --prune=now` reclaims unreachable
+  // objects, so a tree a concurrent recorder just wrote — but whose record has
+  // not been anchored under refs/snapshots/ yet — would be destroyed, leaving
+  // snapshots.json pointing at missing objects. Enqueuing both sides makes the
+  // recorder's map update happen-before the next prune's retained-set copy.
+  let gitTail = Promise.resolve()
+  const enqueueGit = (task) => {
+    const run = gitTail.then(task)
+    gitTail = run.then(() => {}, () => {})
+    return run
+  }
+
   let executablePromise
   const executable = () => {
     executablePromise ??= ctx.subprocess.resolveExecutable('git', undefined, new AbortController().signal).catch(() => null)
@@ -345,7 +364,7 @@ export function mountUndo(ctx, config) {
     return snapshotTree(ctx, config, exe, workspace, new AbortController().signal)
   }
   const recordStart = async (sessionId, turn, cwd) => {
-    const treeId = await snapshotOf(cwd)
+    const treeId = await enqueueGit(() => snapshotOf(cwd))
     if (treeId === null) return
     const key = `${sessionId}#${turn}`
     const existing = snapshots.get(key)
@@ -353,7 +372,7 @@ export function mountUndo(ctx, config) {
     await persist()
   }
   const recordEnd = async (sessionId, turn, cwd) => {
-    const treeId = await snapshotOf(cwd)
+    const treeId = await enqueueGit(() => snapshotOf(cwd))
     if (treeId === null) return
     const key = `${sessionId}#${turn}`
     const existing = snapshots.get(key)
@@ -361,7 +380,7 @@ export function mountUndo(ctx, config) {
     await persist()
   }
 
-  ctx.effect(() => async () => { await writeTail })
+  ctx.effect(() => async () => { await writeTail; await gitTail })
 
   ctx.on('session/event', (session, event) => {
     if (!config.snapshotEnabled) return
@@ -376,7 +395,10 @@ export function mountUndo(ctx, config) {
   ctx.on('tools/pre-execute', async (exec, next) => {
     const sessionId = exec.agent?.session?.id
     const promise = sessionId === undefined ? undefined : pending.get(sessionId)
-    if (promise !== undefined) await promise
+    // Async gates must observe exec.signal: a cancelled tool call must not wait
+    // out the snapshot's git timeout. The registry rechecks cancellation after
+    // the gate settles, so releasing early is safe; next() is always called.
+    if (promise !== undefined) await awaitSnapshot(promise, exec.signal)
     return next()
   })
 
@@ -388,7 +410,7 @@ export function mountUndo(ctx, config) {
   route(SNAPSHOTS_PATH, body => listSnapshots(snapshots, body))
   route(PURGE_PATH, async () => {
     const purged = await purge(ctx, config, snapshots, persist)
-    const pruned = await pruneShadowObjects(ctx, config, await executable(), snapshots)
+    const pruned = await enqueueGit(async () => pruneShadowObjects(ctx, config, await executable(), snapshots))
     return { ok: true, data: { removed: purged.data.removed, repos: pruned.data.repos } }
   })
   route(CLEAR_QUEUE_PATH, body => clearQueue(ctx, body))
@@ -437,15 +459,32 @@ export function mountUndo(ctx, config) {
     }
     if (changed) {
       await persist()
-      await pruneShadowObjects(ctx, config, await executable(), snapshots).catch(() => {})
+      await enqueueGit(async () => pruneShadowObjects(ctx, config, await executable(), snapshots)).catch(() => {})
     }
   }
   // Enforce the retention window once at mount and reclaim the freed git objects.
   void loadPromise.then(async () => {
     await purge(ctx, config, snapshots, persist)
-    await pruneShadowObjects(ctx, config, await executable(), snapshots)
+    await enqueueGit(async () => pruneShadowObjects(ctx, config, await executable(), snapshots))
   }).catch(() => {})
   return { forgetSession }
+}
+
+/**
+ * Wait for a pending start snapshot without outliving the tool call's own
+ * cancellation: an aborted (or already aborted) exec.signal releases the gate
+ * at once, and the snapshot settling removes the abort listener. The promise
+ * never rejects into the gate (the recorder already catches its failures).
+ */
+function awaitSnapshot(promise, signal) {
+  if (signal === undefined) return promise.catch(() => {})
+  if (signal.aborted) return Promise.resolve()
+  return new Promise((resolve) => {
+    const onAbort = () => resolve()
+    const finish = () => { signal.removeEventListener('abort', onAbort); resolve() }
+    signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(finish, finish)
+  })
 }
 
 /**
